@@ -45,10 +45,7 @@ const magnitude = (x: number, y: number): number => {
   return Math.sqrt(x * x + y * y);
 };
 
-const normalize = (
-  x: number,
-  y: number
-): { x: number; y: number } => {
+const normalize = (x: number, y: number): { x: number; y: number } => {
   "worklet";
 
   const length = magnitude(x, y);
@@ -72,7 +69,7 @@ export const reflectVelocity = (
   vx: number,
   vy: number,
   normalX: number,
-  normalY: number
+  normalY: number,
 ): { vx: number; vy: number } => {
   "worklet";
 
@@ -106,43 +103,62 @@ export const reflectFromPaddle = (
 
   const halfWidth = paddleWidth / 2;
 
+  // -1 = far left edge
+  //  0 = center
+  // +1 = far right edge
   const hitOffset = clamp(
     (ball.x - paddleX) / halfWidth,
     -1,
     1
   );
 
-  // Horizontal paddle normal.
-  const reflected = reflectVelocity(
-    ball.vx,
-    ball.vy,
-    0,
-    normalY
-  );
-
-  const speed = clamp(
-    magnitude(reflected.vx, reflected.vy),
-    1,
+  const speed = Math.min(
+    magnitude(ball.vx, ball.vy),
     maxBallSpeed
   );
 
-  const baseAngle = Math.atan2(
-    reflected.vy,
-    reflected.vx
-  );
+  /*
+   * Instead of reflecting the existing angle and then
+   * adding another angle, explicitly construct the
+   * outgoing direction.
+   *
+   * This gives predictable Pong behavior:
+   *
+   * center hit
+   *       ↑
+   *
+   * left edge
+   *      ↖
+   *
+   * right edge
+   *       ↗
+   */
 
-  // Off-center hit changes the outgoing angle.
-  const angle = baseAngle + hitOffset * maxBounceAngle;
+  const angleFromVertical =
+    hitOffset * maxBounceAngle;
 
-  const vx = Math.cos(angle) * speed;
-  const vy = Math.sin(angle) * speed;
+  // X direction comes from hit position.
+  const vx =
+    Math.sin(angleFromVertical) * speed;
+
+  // Y direction depends on which paddle was hit.
+  const vy =
+    normalY * Math.cos(angleFromVertical) * speed;
 
   return {
     x: ball.x,
+
     y:
       normalY > 0
-        ? paddleY + paddleHeight / 2 + ballRadius + 0.5
-        : paddleY - paddleHeight / 2 - ballRadius - 0.5,
+        ? paddleY +
+          paddleHeight / 2 +
+          ballRadius +
+          0.5
+        : paddleY -
+          paddleHeight / 2 -
+          ballRadius -
+          0.5,
+
     vx,
     vy,
   };
@@ -152,7 +168,7 @@ export const createBall = (
   arenaWidth: number,
   arenaHeight: number,
   speed: number,
-  launchAngle: number
+  launchAngle: number,
 ): Ball => {
   "worklet";
 
@@ -166,7 +182,7 @@ export const createBall = (
 
 export const createInitialState = (
   config: PhysicsConfig,
-  launchAngle: number
+  launchAngle: number,
 ): GameState => {
   "worklet";
 
@@ -175,7 +191,7 @@ export const createInitialState = (
       config.arenaWidth,
       config.arenaHeight,
       config.initialBallSpeed,
-      launchAngle
+      launchAngle,
     ),
 
     botPaddleX: config.arenaWidth / 2,
@@ -200,7 +216,7 @@ export const updatePhysics = (
   deltaTime: number,
   playerPaddleX: number,
   launchAngle: number,
-  config: PhysicsConfig
+  config: PhysicsConfig,
 ): GameState => {
   "worklet";
 
@@ -212,67 +228,55 @@ export const updatePhysics = (
   };
 
   // --------------------------------------------------
-// BOT PADDLE
-// --------------------------------------------------
+  // BOT PADDLE
+  // --------------------------------------------------
 
-// Bot paddle ONLY moves on X.
-// Its Y position is fixed by the renderer.
+  // Bot paddle ONLY moves on X.
+  // Its Y position is fixed by the renderer.
 
-let botPaddleX = state.botPaddleX;
+  let botPaddleX = state.botPaddleX;
 
-// Only actively track the ball when it is moving
-// toward the bot.
-//
-// Top paddle is the bot.
-// Ball moving upward => vy < 0.
-if (ball.vy < 0) {
-  const targetX = ball.x;
+  // Only actively track the ball when it is moving
+  // toward the bot.
+  //
+  // Top paddle is the bot.
+  // Ball moving upward => vy < 0.
+  if (ball.vy < 0) {
+    const targetX = ball.x;
 
-  const distance = targetX - botPaddleX;
+    const distance = targetX - botPaddleX;
 
-  // Dead zone prevents pixel-perfect tracking.
-  // If the ball is already close enough, don't move.
-  const reactionDeadZone = 10;
+    // Dead zone prevents pixel-perfect tracking.
+    // If the ball is already close enough, don't move.
+    const reactionDeadZone = 10;
 
-  if (Math.abs(distance) > reactionDeadZone) {
-    const maxMovement =
-      config.botMaxSpeed * dt;
+    if (Math.abs(distance) > reactionDeadZone) {
+      const maxMovement = config.botMaxSpeed * dt;
 
-    const movement = clamp(
-      distance,
-      -maxMovement,
-      maxMovement
-    );
+      const movement = clamp(distance, -maxMovement, maxMovement);
 
-    botPaddleX += movement;
+      botPaddleX += movement;
+    }
+  } else {
+    // When the ball is moving away from the bot,
+    // slowly return toward the center.
+    const centerX = config.arenaWidth / 2;
+
+    const distance = centerX - botPaddleX;
+
+    const returnSpeed = config.botMaxSpeed * 0.35;
+
+    const maxMovement = returnSpeed * dt;
+
+    botPaddleX += clamp(distance, -maxMovement, maxMovement);
   }
-} else {
-  // When the ball is moving away from the bot,
-  // slowly return toward the center.
-  const centerX = config.arenaWidth / 2;
 
-  const distance = centerX - botPaddleX;
-
-  const returnSpeed =
-    config.botMaxSpeed * 0.35;
-
-  const maxMovement =
-    returnSpeed * dt;
-
-  botPaddleX += clamp(
-    distance,
-    -maxMovement,
-    maxMovement
+  // Never allow the bot paddle to leave the arena.
+  botPaddleX = clamp(
+    botPaddleX,
+    config.paddleWidth / 2,
+    config.arenaWidth - config.paddleWidth / 2,
   );
-}
-
-// Never allow the bot paddle to leave the arena.
-botPaddleX = clamp(
-  botPaddleX,
-  config.paddleWidth / 2,
-  config.arenaWidth -
-    config.paddleWidth / 2
-);
 
   // --------------------------------------------------
   // BALL MOVEMENT
@@ -285,36 +289,19 @@ botPaddleX = clamp(
   // SIDE WALLS
   // --------------------------------------------------
 
-  if (
-    ball.x - config.ballRadius <= 0 &&
-    ball.vx < 0
-  ) {
+  if (ball.x - config.ballRadius <= 0 && ball.vx < 0) {
     ball.x = config.ballRadius;
 
-    const reflected = reflectVelocity(
-      ball.vx,
-      ball.vy,
-      1,
-      0
-    );
+    const reflected = reflectVelocity(ball.vx, ball.vy, 1, 0);
 
     ball.vx = reflected.vx;
     ball.vy = reflected.vy;
   }
 
-  if (
-    ball.x + config.ballRadius >= config.arenaWidth &&
-    ball.vx > 0
-  ) {
-    ball.x =
-      config.arenaWidth - config.ballRadius;
+  if (ball.x + config.ballRadius >= config.arenaWidth && ball.vx > 0) {
+    ball.x = config.arenaWidth - config.ballRadius;
 
-    const reflected = reflectVelocity(
-      ball.vx,
-      ball.vy,
-      -1,
-      0
-    );
+    const reflected = reflectVelocity(ball.vx, ball.vy, -1, 0);
 
     ball.vx = reflected.vx;
     ball.vy = reflected.vy;
@@ -324,11 +311,9 @@ botPaddleX = clamp(
   // PADDLE POSITIONS
   // --------------------------------------------------
 
-  const paddleYBottom =
-    config.arenaHeight - config.paddleMargin;
+  const paddleYBottom = config.arenaHeight - config.paddleMargin;
 
-  const paddleYTop =
-    config.paddleMargin;
+  const paddleYTop = config.paddleMargin;
 
   // --------------------------------------------------
   // LOCAL PLAYER PADDLE
@@ -336,14 +321,10 @@ botPaddleX = clamp(
 
   const playerHit =
     ball.vy > 0 &&
-    ball.y + config.ballRadius >=
-      paddleYBottom - config.paddleHeight / 2 &&
-    ball.y - config.ballRadius <=
-      paddleYBottom + config.paddleHeight / 2 &&
-    ball.x >=
-      playerPaddleX - config.paddleWidth / 2 &&
-    ball.x <=
-      playerPaddleX + config.paddleWidth / 2;
+    ball.y + config.ballRadius >= paddleYBottom - config.paddleHeight / 2 &&
+    ball.y - config.ballRadius <= paddleYBottom + config.paddleHeight / 2 &&
+    ball.x >= playerPaddleX - config.paddleWidth / 2 &&
+    ball.x <= playerPaddleX + config.paddleWidth / 2;
 
   if (playerHit) {
     ball = reflectFromPaddle(
@@ -355,7 +336,7 @@ botPaddleX = clamp(
       config.ballRadius,
       -1,
       config.maxBounceAngle,
-      config.maxBallSpeed
+      config.maxBallSpeed,
     );
   }
 
@@ -365,14 +346,10 @@ botPaddleX = clamp(
 
   const botHit =
     ball.vy < 0 &&
-    ball.y - config.ballRadius <=
-      paddleYTop + config.paddleHeight / 2 &&
-    ball.y + config.ballRadius >=
-      paddleYTop - config.paddleHeight / 2 &&
-    ball.x >=
-      botPaddleX - config.paddleWidth / 2 &&
-    ball.x <=
-      botPaddleX + config.paddleWidth / 2;
+    ball.y - config.ballRadius <= paddleYTop + config.paddleHeight / 2 &&
+    ball.y + config.ballRadius >= paddleYTop - config.paddleHeight / 2 &&
+    ball.x >= botPaddleX - config.paddleWidth / 2 &&
+    ball.x <= botPaddleX + config.paddleWidth / 2;
 
   if (botHit) {
     ball = reflectFromPaddle(
@@ -384,7 +361,7 @@ botPaddleX = clamp(
       config.ballRadius,
       1,
       config.maxBounceAngle,
-      config.maxBallSpeed
+      config.maxBallSpeed,
     );
   }
 
@@ -392,30 +369,26 @@ botPaddleX = clamp(
   // MISSES / SCORING
   // --------------------------------------------------
 
-  if (
-    ball.y - config.ballRadius > config.arenaHeight
-  ) {
+  if (ball.y - config.ballRadius > config.arenaHeight) {
     return {
       ball: createBall(
         config.arenaWidth,
         config.arenaHeight,
         config.initialBallSpeed,
-        launchAngle
+        launchAngle,
       ),
       botPaddleX,
       lastScoredBy: "player",
     };
   }
 
-  if (
-    ball.y + config.ballRadius < 0
-  ) {
+  if (ball.y + config.ballRadius < 0) {
     return {
       ball: createBall(
         config.arenaWidth,
         config.arenaHeight,
         config.initialBallSpeed,
-        launchAngle
+        launchAngle,
       ),
       botPaddleX,
       lastScoredBy: "bot",

@@ -1,9 +1,4 @@
-import React from "react";
-import {
-  StyleSheet,
-  Text,
-  View,
-} from "react-native";
+import { StyleSheet, Text, View } from "react-native";
 
 import {
   Gesture,
@@ -24,8 +19,8 @@ import {
   type PhysicsConfig,
 } from "@/game/engine/physics";
 
-import { useGameStore } from "@/store/game-store";
 import { GameRenderer } from "@/render/game-renderer";
+import { useGameStore } from "@/store/game-store";
 
 const CONFIG: PhysicsConfig = {
   arenaWidth: 360,
@@ -48,33 +43,20 @@ const CONFIG: PhysicsConfig = {
 const randomLaunchAngle = () => {
   "worklet";
 
-  const angle =
-    Math.random() * (Math.PI * 0.8) +
-    Math.PI * 0.1;
+  const angle = Math.random() * (Math.PI * 0.8) + Math.PI * 0.1;
 
-  return Math.random() < 0.5
-    ? angle
-    : angle + Math.PI;
+  return Math.random() < 0.5 ? angle : angle + Math.PI;
 };
 
 export default function GameScreen() {
-  const playerPaddleX = useSharedValue(
-    CONFIG.arenaWidth / 2
-  );
+  const playerPaddleX = useSharedValue(CONFIG.arenaWidth / 2);
 
   const gameState = useSharedValue(
-    createInitialState(
-      CONFIG,
-      randomLaunchAngle()
-    )
+    createInitialState(CONFIG, randomLaunchAngle()),
   );
 
-  const scorePoint = (
-    player: "player" | "bot"
-  ) => {
-    useGameStore
-      .getState()
-      .addPoint(player);
+  const scorePoint = (player: "player" | "bot") => {
+    useGameStore.getState().addPoint(player);
   };
 
   /**
@@ -83,23 +65,17 @@ export default function GameScreen() {
    * Instead of accumulating event.changeX,
    * directly position the paddle at the finger.
    */
-  const panGesture = Gesture.Pan()
-    .onUpdate((event) => {
-      const halfPaddle =
-        CONFIG.paddleWidth / 2;
+  const panGesture = Gesture.Pan().onUpdate((event) => {
+    const halfPaddle = CONFIG.paddleWidth / 2;
 
-      const minX = halfPaddle;
-      const maxX =
-        CONFIG.arenaWidth - halfPaddle;
+    const minX = halfPaddle;
+    const maxX = CONFIG.arenaWidth - halfPaddle;
 
-      // event.x is relative to the GestureDetector.
-      const nextX = Math.max(
-        minX,
-        Math.min(maxX, event.x)
-      );
+    // event.x is relative to the GestureDetector.
+    const nextX = Math.max(minX, Math.min(maxX, event.x));
 
-      playerPaddleX.value = nextX;
-    });
+    playerPaddleX.value = nextX;
+  });
 
   /**
    * Physics loop.
@@ -107,8 +83,7 @@ export default function GameScreen() {
    * This runs on the UI thread.
    */
   useFrameCallback((frameInfo) => {
-    const deltaTime =
-      frameInfo.timeSincePreviousFrame;
+    const deltaTime = frameInfo.timeSincePreviousFrame;
 
     if (deltaTime == null) {
       return;
@@ -119,27 +94,24 @@ export default function GameScreen() {
       deltaTime / 1000,
       playerPaddleX.value,
       0,
-      CONFIG
+      CONFIG,
     );
 
     /**
      * A player or bot missed.
      */
     if (nextState.lastScoredBy !== null) {
-      const launchAngle =
-        randomLaunchAngle();
+      const launchAngle = randomLaunchAngle();
 
       const resetBall = createBall(
         CONFIG.arenaWidth,
         CONFIG.arenaHeight,
         CONFIG.initialBallSpeed,
-        launchAngle
+        launchAngle,
       );
 
       // Update score on JS thread.
-      runOnJS(scorePoint)(
-        nextState.lastScoredBy
-      );
+      runOnJS(scorePoint)(nextState.lastScoredBy);
 
       // Reset ball and clear scoring event.
       gameState.value = {
@@ -154,26 +126,18 @@ export default function GameScreen() {
     gameState.value = nextState;
   });
 
-  const playerScore = useGameStore(
-    (state) => state.playerScore
-  );
+  const playerScore = useGameStore((state) => state.playerScore);
 
-  const botScore = useGameStore(
-    (state) => state.botScore
-  );
+  const botScore = useGameStore((state) => state.botScore);
 
   return (
-    <GestureHandlerRootView
-      style={styles.root}
-    >
+    <GestureHandlerRootView style={styles.root}>
       <View style={styles.container}>
         <Text style={styles.score}>
           {botScore} : {playerScore}
         </Text>
 
-        <GestureDetector
-          gesture={panGesture}
-        >
+        <GestureDetector gesture={panGesture}>
           {/*
             IMPORTANT:
             Give the gesture surface the exact
@@ -187,9 +151,7 @@ export default function GameScreen() {
           >
             <GameRenderer
               state={gameState}
-              playerPaddleX={
-                playerPaddleX
-              }
+              playerPaddleX={playerPaddleX}
               config={CONFIG}
             />
           </View>
