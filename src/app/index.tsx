@@ -8,6 +8,7 @@ import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { WebBadge } from '@/components/web-badge';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
+import GameScreen from '@/screens/game-screen';
 
 function getDevMenuHint() {
   if (Platform.OS === 'web') {
@@ -29,6 +30,7 @@ function getDevMenuHint() {
 }
 
 export default function HomeScreen() {
+  return(<GameScreen/>);
   return (
     <ThemedView style={styles.container}>
       <SafeAreaView style={styles.safeArea}>
