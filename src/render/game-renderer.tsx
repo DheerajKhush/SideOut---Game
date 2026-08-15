@@ -3,9 +3,8 @@ import {
   Circle,
   Group,
   Line,
-  Rect,
   Text,
-  matchFont,
+  matchFont
 } from "@shopify/react-native-skia";
 
 import { SharedValue, useDerivedValue } from "react-native-reanimated";
@@ -426,25 +425,6 @@ const WallVisual = ({
         strokeCap="round"
       />
 
-      {isLocal && (
-        <>
-          <Circle
-            cx={paddleCenter.x}
-            cy={paddleCenter.y}
-            r={15}
-            color={primaryColor}
-            opacity={0.06}
-          />
-
-          <Circle
-            cx={paddleCenter.x}
-            cy={paddleCenter.y}
-            r={3}
-            color="#FFFFFF"
-          />
-        </>
-      )}
-
       <Group origin={wallCenter} transform={labelTransform}>
         <Text
           x={labelX}
@@ -660,69 +640,6 @@ export const GameRenderer = ({
         height: canvasHeight,
       }}
     >
-      <Rect
-        x={0}
-        y={0}
-        width={canvasWidth}
-        height={canvasHeight}
-        color="#03070D"
-      />
-
-      <Rect
-        x={8}
-        y={8}
-        width={canvasWidth - 16}
-        height={canvasHeight - 16}
-        color="#050B14"
-        opacity={0.75}
-      />
-
-      <Group opacity={0.055}>
-        {Array.from({
-          length: 9,
-        }).map((_, index) => {
-          const x = (canvasWidth / 8) * index;
-
-          return (
-            <Line
-              key={`grid-v-${index}`}
-              p1={{
-                x,
-                y: 0,
-              }}
-              p2={{
-                x,
-                y: canvasHeight,
-              }}
-              color="#6B8CAA"
-              strokeWidth={1}
-            />
-          );
-        })}
-
-        {Array.from({
-          length: 11,
-        }).map((_, index) => {
-          const y = (canvasHeight / 10) * index;
-
-          return (
-            <Line
-              key={`grid-h-${index}`}
-              p1={{
-                x: 0,
-                y,
-              }}
-              p2={{
-                x: canvasWidth,
-                y,
-              }}
-              color="#6B8CAA"
-              strokeWidth={1}
-            />
-          );
-        })}
-      </Group>
-
       <Group origin={geometry.center} transform={renderTransform}>
         {geometry.walls.map((wall) => {
           const playerId = config.activePlayerIds[wall.slot];

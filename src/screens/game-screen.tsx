@@ -44,6 +44,8 @@ import {
 
 import { useGameStore } from "@/store/game-store";
 
+import { BACKGROUND_OUTER } from "@/constants/game-colors";
+import BackgroundGrid from "@/render/backgroundGrid";
 import { GameRenderer } from "@/render/game-renderer";
 
 const PLAYER_COUNT = 8;
@@ -737,12 +739,9 @@ export default function GameScreen() {
         </Text>
 
         <GestureDetector gesture={panGesture}>
-          <View
-            style={{
-              width,
-              height,
-            }}
-          >
+          <View style={{ height, width }}>
+            <BackgroundGrid width={width} height={height} />
+
             <GameRenderer
               state={gameState}
               playerPaddleOffset={playerPaddleOffset}
@@ -763,11 +762,11 @@ export default function GameScreen() {
 const styles = StyleSheet.create({
   root: {
     flex: 1,
+    backgroundColor: BACKGROUND_OUTER
   },
 
   container: {
     flex: 1,
-    backgroundColor: "#050811",
   },
 
   debugButton: {
