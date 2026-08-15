@@ -10,7 +10,11 @@ import {
 
 import { SharedValue, useDerivedValue } from "react-native-reanimated";
 
-import type { GameState, PhysicsConfig } from "@/game/engine/physics";
+import {
+  MAX_BALL_COUNT,
+  type GameState,
+  type PhysicsConfig,
+} from "@/game/engine/physics";
 import type { PolygonGeometry, PolygonWall, Vec2 } from "@/game/engine/polygon";
 
 interface GeometryTransition {
@@ -314,6 +318,93 @@ const WallVisual = ({
   );
 };
 
+interface BallVisualProps {
+  state: SharedValue<GameState>;
+  ballIndex: number;
+  ballRadius: number;
+}
+
+const BallVisual = ({ state, ballIndex, ballRadius }: BallVisualProps) => {
+  const ballX = useDerivedValue(() => {
+    return state.value.balls[ballIndex]?.x ?? 0;
+  });
+
+  const ballY = useDerivedValue(() => {
+    return state.value.balls[ballIndex]?.y ?? 0;
+  });
+
+  const ballPosition = useDerivedValue(() => ({
+    x: ballX.value,
+    y: ballY.value,
+  }));
+
+  const ballDirection = useDerivedValue(() => {
+    const ball = state.value.balls[ballIndex];
+
+    if (!ball) {
+      return { x: 0, y: 0 };
+    }
+
+    const speed = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+
+    if (speed < 0.001) {
+      return { x: 0, y: 0 };
+    }
+
+    return {
+      x: ball.vx / speed,
+      y: ball.vy / speed,
+    };
+  });
+
+  const ballTail = useDerivedValue(() => {
+    const direction = ballDirection.value;
+    const length = 42;
+
+    return {
+      x: ballPosition.value.x - direction.x * length,
+      y: ballPosition.value.y - direction.y * length,
+    };
+  });
+
+  const opacity = useDerivedValue(() => (state.value.balls[ballIndex] ? 1 : 0));
+
+  return (
+    <Group opacity={opacity}>
+      <Line
+        p1={ballTail}
+        p2={ballPosition}
+        color="#48BFFF"
+        strokeWidth={18}
+        opacity={0.025}
+        strokeCap="round"
+      />
+      <Line
+        p1={ballTail}
+        p2={ballPosition}
+        color="#48BFFF"
+        strokeWidth={10}
+        opacity={0.055}
+        strokeCap="round"
+      />
+      <Line
+        p1={ballTail}
+        p2={ballPosition}
+        color="#8BD8FF"
+        strokeWidth={4}
+        opacity={0.16}
+        strokeCap="round"
+      />
+
+      <Circle cx={ballX} cy={ballY} r={26} color="#43BFFF" opacity={0.025} />
+      <Circle cx={ballX} cy={ballY} r={17} color="#55C7FF" opacity={0.07} />
+      <Circle cx={ballX} cy={ballY} r={11} color="#A8E5FF" opacity={0.18} />
+      <Circle cx={ballX} cy={ballY} r={ballRadius} color="#DDF7FF" />
+      <Circle cx={ballX} cy={ballY} r={ballRadius * 0.5} color="#FFFFFF" />
+    </Group>
+  );
+};
+
 /* =========================================================
  * MAIN RENDERER
  * ======================================================= */
@@ -372,36 +463,6 @@ export const GameRenderer = ({
         rotate: Math.PI / 2 - angle,
       },
     ];
-  });
-
-  const ballX = useDerivedValue(() => state.value.ball.x);
-  const ballY = useDerivedValue(() => state.value.ball.y);
-
-  const ballPosition = useDerivedValue(() => ({
-    x: ballX.value,
-    y: ballY.value,
-  }));
-
-  const ballDirection = useDerivedValue(() => {
-    const { vx, vy } = state.value.ball;
-    const speed = Math.sqrt(vx * vx + vy * vy);
-
-    if (speed < 0.001) return { x: 0, y: 0 };
-
-    return {
-      x: vx / speed,
-      y: vy / speed,
-    };
-  });
-
-  const ballTail = useDerivedValue(() => {
-    const direction = ballDirection.value;
-    const length = 42;
-
-    return {
-      x: ballPosition.value.x - direction.x * length,
-      y: ballPosition.value.y - direction.y * length,
-    };
   });
 
   const canvasWidth = geometry.center.x * 2;
@@ -531,41 +592,14 @@ export const GameRenderer = ({
           opacity={0.75}
         />
 
-        <Line
-          p1={ballTail}
-          p2={ballPosition}
-          color="#48BFFF"
-          strokeWidth={18}
-          opacity={0.025}
-          strokeCap="round"
-        />
-        <Line
-          p1={ballTail}
-          p2={ballPosition}
-          color="#48BFFF"
-          strokeWidth={10}
-          opacity={0.055}
-          strokeCap="round"
-        />
-        <Line
-          p1={ballTail}
-          p2={ballPosition}
-          color="#8BD8FF"
-          strokeWidth={4}
-          opacity={0.16}
-          strokeCap="round"
-        />
-
-        <Circle cx={ballX} cy={ballY} r={26} color="#43BFFF" opacity={0.025} />
-        <Circle cx={ballX} cy={ballY} r={17} color="#55C7FF" opacity={0.07} />
-        <Circle cx={ballX} cy={ballY} r={11} color="#A8E5FF" opacity={0.18} />
-        <Circle cx={ballX} cy={ballY} r={config.ballRadius} color="#DDF7FF" />
-        <Circle
-          cx={ballX}
-          cy={ballY}
-          r={config.ballRadius * 0.5}
-          color="#FFFFFF"
-        />
+        {Array.from({ length: MAX_BALL_COUNT }).map((_, ballIndex) => (
+          <BallVisual
+            key={`ball-${ballIndex}`}
+            state={state}
+            ballIndex={ballIndex}
+            ballRadius={config.ballRadius}
+          />
+        ))}
       </Group>
     </Canvas>
   );

@@ -1,28 +1,18 @@
 import type { PolygonGeometry, PolygonWall, Vec2 } from "./polygon";
 
-/**
- * Phase 4 — difficulty escalation
- *
- * The ball gains this much speed after every successful paddle hit.
- */
-export const SPEED_INCREMENT = 12;
+/** Phase 4b — multi-ball spawning. */
+export const SPAWN_INTERVAL_MS = 60_000;
+export const MAX_BALL_COUNT = 3;
 
-/**
- * Absolute maximum ball speed.
- *
- * Keep this as a module-level constant so the speed ceiling is explicit
- * and cannot become an inline magic number.
- */
+/** First additional ball appears after this delay into the round. */
+export const INITIAL_SPAWN_DELAY_MS = 60_000;
+
+/** Phase 4a speed escalation. */
+export const SPEED_INCREMENT = 12;
 export const MAX_BALL_SPEED = 650;
 
-/**
- * A sub-step is considered safe when the ball travels no more than this
- * fraction of the paddle length in one collision step.
- *
- * This is intentionally derived from paddle size rather than being a
- * hardcoded pixel distance.
- */
-const SUBSTEP_DISTANCE_FRACTION = 1 / 3;
+/** Collision sub-step threshold as a fraction of paddle length. */
+const SUBSTEP_DISTANCE_FRACTION = 0.25;
 
 export interface Ball {
   x: number;
@@ -32,7 +22,7 @@ export interface Ball {
 }
 
 export interface GameState {
-  ball: Ball;
+  balls: Ball[];
 
   /**
    * Paddle center offset along each active wall's
@@ -62,11 +52,6 @@ export interface PhysicsConfig {
   paddleThickness: number;
 
   initialBallSpeed: number;
-
-  /**
-   * Kept for compatibility with the existing GameScreen config.
-   * Phase 4 uses MAX_BALL_SPEED as the authoritative ceiling.
-   */
   maxBallSpeed: number;
 
   botMaxSpeed: number;
@@ -87,6 +72,9 @@ export interface PhysicsResult {
 
   /** Stable player id that owns the missed wall. */
   missedPlayerId: number | null;
+
+  /** Index of the ball that caused the miss. */
+  missedBallIndex: number | null;
 }
 
 const clamp = (value: number, min: number, max: number): number => {
@@ -166,12 +154,6 @@ interface WallCollision {
   point: Vec2;
 }
 
-/**
- * Find the earliest collision during this small physics step.
- *
- * The important part for Phase 4 is that this function is called for every
- * sub-step rather than once for the entire frame.
- */
 const findEarliestCollision = (
   ball: Ball,
   dt: number,
@@ -181,11 +163,7 @@ const findEarliestCollision = (
 ): WallCollision | null => {
   "worklet";
 
-  const current = {
-    x: ball.x,
-    y: ball.y,
-  };
-
+  const current = { x: ball.x, y: ball.y };
   const next = {
     x: ball.x + ball.vx * dt,
     y: ball.y + ball.vy * dt,
@@ -195,9 +173,9 @@ const findEarliestCollision = (
 
   for (let i = 0; i < geometry.walls.length; i++) {
     // During a shatter transition the removed wall is physically gone.
-    if (i === ignoredWallSlot) {
-      continue;
-    }
+    // The renderer may still be animating the remaining walls, but the ball
+    // must be allowed to pass through the old removed edge.
+    if (i === ignoredWallSlot) continue;
 
     const wall = geometry.walls[i];
 
@@ -213,12 +191,15 @@ const findEarliestCollision = (
 
     const currentDistance = dot(currentRelative, wall.outward);
     const nextDistance = dot(nextRelative, wall.outward);
-
     const collisionDistance = -radius;
 
     /**
-     * Collision only occurs when the ball crosses the collision plane
-     * from inside the arena to outside.
+     * Collision occurs only when the ball crosses the wall's collision
+     * plane from inside the arena to outside it.
+     *
+     * The strict direction of this test is important: after a reflection
+     * the ball is placed slightly inside the wall and is moving away from
+     * it, so the same wall must not immediately collide again.
      */
     if (
       currentDistance >= collisionDistance ||
@@ -245,11 +226,7 @@ const findEarliestCollision = (
     };
 
     if (earliest === null || time < earliest.time) {
-      earliest = {
-        wall,
-        time,
-        point,
-      };
+      earliest = { wall, time, point };
     }
   }
 
@@ -267,14 +244,7 @@ const updateBotPaddle = (
 
   const maxOffset = Math.max(0, wall.length / 2 - config.paddleLength / 2);
 
-  const movingTowardWall =
-    dot(
-      {
-        x: ball.vx,
-        y: ball.vy,
-      },
-      wall.outward,
-    ) > 0;
+  const movingTowardWall = dot({ x: ball.vx, y: ball.vy }, wall.outward) > 0;
 
   let target = 0;
 
@@ -294,28 +264,75 @@ const updateBotPaddle = (
   }
 
   const maxMovement = config.botMaxSpeed * dt;
-
   const movement = clamp(distance, -maxMovement, maxMovement);
 
   return clamp(currentOffset + movement, -maxOffset, maxOffset);
 };
 
+const bounceFromPaddle = (
+  ball: Ball,
+  wall: PolygonWall,
+  paddleOffset: number,
+  collisionPoint: Vec2,
+  config: PhysicsConfig,
+): Ball => {
+  "worklet";
+
+  const reflected = reflectVelocity(
+    ball.vx,
+    ball.vy,
+    wall.outward.x,
+    wall.outward.y,
+  );
+
+  const currentSpeed = clamp(
+    magnitude(reflected.x, reflected.y),
+    1,
+    MAX_BALL_SPEED,
+  );
+
+  // Phase 4a: every successful paddle hit increases speed, capped globally.
+  const speed = Math.min(currentSpeed + SPEED_INCREMENT, MAX_BALL_SPEED);
+
+  const relative = {
+    x: collisionPoint.x - wall.center.x,
+    y: collisionPoint.y - wall.center.y,
+  };
+
+  const hitPosition = dot(relative, wall.tangent);
+
+  const hitOffset = clamp(
+    (hitPosition - paddleOffset) / (config.paddleLength / 2),
+    -1,
+    1,
+  );
+
+  const reflectedAngle = Math.atan2(reflected.y, reflected.x);
+  const inwardAngle = Math.atan2(-wall.outward.y, -wall.outward.x);
+
+  let relativeAngle = normalizeAngle(reflectedAngle - inwardAngle);
+  relativeAngle += hitOffset * config.maxBounceAngle;
+
+  const maxAngleFromNormal = Math.PI * 0.44;
+  relativeAngle = clamp(relativeAngle, -maxAngleFromNormal, maxAngleFromNormal);
+
+  const finalDirection = rotateVector(
+    { x: -wall.outward.x, y: -wall.outward.y },
+    relativeAngle,
+  );
+
+  return {
+    x: collisionPoint.x - wall.outward.x * (config.ballRadius + 0.5),
+    y: collisionPoint.y - wall.outward.y * (config.ballRadius + 0.5),
+    vx: finalDirection.x * speed,
+    vy: finalDirection.y * speed,
+  };
+};
+
 /**
- * Calculates how many collision-safe sub-steps are required.
+ * Pure physics step.
  *
- * The threshold is NOT a hardcoded pixel value.
- *
- * Example with the current game:
- *
- *   paddleLength = 58
- *   threshold    = 58 / 3 = 19.33 px
- *
- * If the ball would travel more than 19.33 px during this tick,
- * the tick is split into multiple collision checks.
- *
- * MAX_BALL_SPEED is also used when determining the theoretical maximum
- * number of sub-steps required, keeping the calculation bounded by the
- * configured maximum speed.
+ * Geometry is canonical. The renderer is responsible for viewer rotation.
  */
 const getSubstepCount = (
   speed: number,
@@ -336,99 +353,18 @@ const getSubstepCount = (
     return 1;
   }
 
-  const requiredSubsteps = Math.ceil(travelDistance / maxDistancePerSubstep);
+  const required = Math.ceil(travelDistance / maxDistancePerSubstep);
 
-  /**
-   * Bound the number of sub-steps using the actual maximum ball speed.
-   *
-   * This prevents an unexpected velocity from producing an unbounded
-   * number of iterations.
-   */
-  const maximumSubsteps = Math.ceil(
-    (MAX_BALL_SPEED * dt) / maxDistancePerSubstep,
-  );
+  const maximum = Math.ceil((MAX_BALL_SPEED * dt) / maxDistancePerSubstep);
 
-  return Math.max(1, Math.min(requiredSubsteps, maximumSubsteps));
+  return Math.max(1, Math.min(required, maximum));
 };
 
-const bounceFromPaddle = (
+const updateSingleBall = (
   ball: Ball,
-  wall: PolygonWall,
-  paddleOffset: number,
-  collisionPoint: Vec2,
-  config: PhysicsConfig,
-): Ball => {
-  "worklet";
-
-  const reflected = reflectVelocity(
-    ball.vx,
-    ball.vy,
-    wall.outward.x,
-    wall.outward.y,
-  );
-
-  /**
-   * Phase 4 speed escalation.
-   *
-   * Increase speed only after a successful paddle collision.
-   * Never allow it to exceed MAX_BALL_SPEED.
-   */
-  const currentSpeed = magnitude(reflected.x, reflected.y);
-
-  const nextSpeed = Math.min(currentSpeed + SPEED_INCREMENT, MAX_BALL_SPEED);
-
-  const relative = {
-    x: collisionPoint.x - wall.center.x,
-    y: collisionPoint.y - wall.center.y,
-  };
-
-  const hitPosition = dot(relative, wall.tangent);
-
-  const hitOffset = clamp(
-    (hitPosition - paddleOffset) / (config.paddleLength / 2),
-    -1,
-    1,
-  );
-
-  const reflectedAngle = Math.atan2(reflected.y, reflected.x);
-
-  const inwardAngle = Math.atan2(-wall.outward.y, -wall.outward.x);
-
-  let relativeAngle = normalizeAngle(reflectedAngle - inwardAngle);
-
-  relativeAngle += hitOffset * config.maxBounceAngle;
-
-  const maxAngleFromNormal = Math.PI * 0.44;
-
-  relativeAngle = clamp(relativeAngle, -maxAngleFromNormal, maxAngleFromNormal);
-
-  const finalDirection = rotateVector(
-    {
-      x: -wall.outward.x,
-      y: -wall.outward.y,
-    },
-    relativeAngle,
-  );
-
-  return {
-    x: collisionPoint.x - wall.outward.x * (config.ballRadius + 0.5),
-
-    y: collisionPoint.y - wall.outward.y * (config.ballRadius + 0.5),
-
-    vx: finalDirection.x * nextSpeed,
-    vy: finalDirection.y * nextSpeed,
-  };
-};
-
-/**
- * Process one small physics step.
- *
- * This function intentionally processes only one collision at a time.
- * updatePhysics() repeatedly invokes it when sub-stepping is required.
- */
-const updatePhysicsStep = (
+  ballIndex: number,
   state: GameState,
-  dt: number,
+  deltaTime: number,
   localPlayerId: number,
   localPaddleOffset: number,
   config: PhysicsConfig,
@@ -438,7 +374,10 @@ const updatePhysicsStep = (
 ): PhysicsResult => {
   "worklet";
 
+  const dt = clamp(deltaTime, 0, 0.033);
   const paddleOffsets = [...state.paddleOffsets];
+  const nextBalls = [...state.balls];
+  let currentLastHitter = state.lastHitter;
 
   const localWallIndex = findActiveWallIndex(
     localPlayerId,
@@ -447,7 +386,6 @@ const updatePhysicsStep = (
 
   if (localWallIndex >= 0) {
     const localWall = physicsGeometry.walls[localWallIndex];
-
     const localMaxOffset = Math.max(
       0,
       localWall.length / 2 - config.paddleLength / 2,
@@ -460,189 +398,139 @@ const updatePhysicsStep = (
     );
   }
 
-  /**
-   * Update bot paddles for this sub-step rather than once for the
-   * entire frame. This keeps paddle movement synchronized with the
-   * smaller collision timestep.
-   */
-  for (let i = 0; i < physicsActivePlayerIds.length; i++) {
-    if (i === localWallIndex) {
+  const substeps = getSubstepCount(
+    magnitude(ball.vx, ball.vy),
+    dt,
+    config.paddleLength,
+  );
+
+  const substepDt = dt / substeps;
+  let currentBall = ball;
+
+  for (let step = 0; step < substeps; step++) {
+    const collision = findEarliestCollision(
+      currentBall,
+      substepDt,
+      physicsGeometry,
+      config.ballRadius,
+      ignoredWallSlot,
+    );
+
+    if (collision === null) {
+      currentBall = {
+        x: currentBall.x + currentBall.vx * substepDt,
+        y: currentBall.y + currentBall.vy * substepDt,
+        vx: currentBall.vx,
+        vy: currentBall.vy,
+      };
       continue;
     }
 
-    paddleOffsets[i] = updateBotPaddle(
-      paddleOffsets[i] ?? 0,
-      physicsGeometry.walls[i],
-      state.ball,
-      dt,
-      config,
-    );
-  }
+    const wall = collision.wall;
 
-  const collision = findEarliestCollision(
-    state.ball,
-    dt,
-    physicsGeometry,
-    config.ballRadius,
-    ignoredWallSlot,
-  );
+    if (wall.slot >= physicsActivePlayerIds.length) {
+      const reflected = reflectVelocity(
+        currentBall.vx,
+        currentBall.vy,
+        wall.outward.x,
+        wall.outward.y,
+      );
 
-  /**
-   * No collision during this sub-step.
-   */
-  if (collision === null) {
-    return {
-      state: {
-        ball: {
-          x: state.ball.x + state.ball.vx * dt,
-          y: state.ball.y + state.ball.vy * dt,
-          vx: state.ball.vx,
-          vy: state.ball.vy,
-        },
-        paddleOffsets,
-        lastHitter: state.lastHitter,
-      },
-      missedWall: null,
-      missedPlayerId: null,
-    };
-  }
+      const reflectedSpeed = magnitude(reflected.x, reflected.y);
+      const minimumVerticalRatio = 0.3;
+      const minimumVerticalSpeed = reflectedSpeed * minimumVerticalRatio;
 
-  const wall = collision.wall;
+      let reflectedVx = reflected.x;
+      let reflectedVy = reflected.y;
 
-  /**
-   * In the 2-player rectangle, walls 2 and 3 are passive side
-   * boundaries. They reflect the ball but never cost a life.
-   */
-  if (wall.slot >= physicsActivePlayerIds.length) {
-    const reflected = reflectVelocity(
-      state.ball.vx,
-      state.ball.vy,
-      wall.outward.x,
-      wall.outward.y,
-    );
+      if (Math.abs(reflectedVy) < minimumVerticalSpeed) {
+        const verticalSign =
+          Math.abs(reflectedVy) > 0.0001
+            ? reflectedVy > 0
+              ? 1
+              : -1
+            : currentBall.y < config.geometry.center.y
+              ? 1
+              : -1;
 
-    /**
-     * Prevent a perfectly horizontal trajectory from getting trapped
-     * between the two passive side walls.
-     *
-     * Speed is preserved.
-     */
-    const reflectedSpeed = magnitude(reflected.x, reflected.y);
+        reflectedVy = verticalSign * minimumVerticalSpeed;
+        reflectedVx =
+          Math.sign(reflectedVx || 1) *
+          Math.sqrt(
+            Math.max(
+              0,
+              reflectedSpeed * reflectedSpeed - reflectedVy * reflectedVy,
+            ),
+          );
+      }
 
-    const minimumVerticalRatio = 0.3;
-
-    const minimumVerticalSpeed = reflectedSpeed * minimumVerticalRatio;
-
-    let reflectedVx = reflected.x;
-    let reflectedVy = reflected.y;
-
-    if (Math.abs(reflectedVy) < minimumVerticalSpeed) {
-      const verticalSign =
-        Math.abs(reflectedVy) > 0.0001
-          ? reflectedVy > 0
-            ? 1
-            : -1
-          : state.ball.y < config.geometry.center.y
-            ? 1
-            : -1;
-
-      reflectedVy = verticalSign * minimumVerticalSpeed;
-
-      reflectedVx =
-        Math.sign(reflectedVx || 1) *
-        Math.sqrt(
-          Math.max(
-            0,
-            reflectedSpeed * reflectedSpeed - reflectedVy * reflectedVy,
-          ),
-        );
+      currentBall = {
+        x: collision.point.x - wall.outward.x * (config.ballRadius + 0.5),
+        y: collision.point.y - wall.outward.y * (config.ballRadius + 0.5),
+        vx: reflectedVx,
+        vy: reflectedVy,
+      };
+      continue;
     }
 
-    return {
-      state: {
-        ball: {
-          x: collision.point.x - wall.outward.x * (config.ballRadius + 0.5),
+    const paddleOffset = paddleOffsets[wall.slot] ?? 0;
+    const relativeToCenter = {
+      x: collision.point.x - wall.center.x,
+      y: collision.point.y - wall.center.y,
+    };
 
-          y: collision.point.y - wall.outward.y * (config.ballRadius + 0.5),
+    const ballPositionOnWall = dot(relativeToCenter, wall.tangent);
+    const paddleHalf = config.paddleLength / 2;
+    const onWallSegment = Math.abs(ballPositionOnWall) <= wall.length / 2;
+    const paddleHit =
+      onWallSegment &&
+      Math.abs(ballPositionOnWall - paddleOffset) <= paddleHalf;
 
-          vx: reflectedVx,
-          vy: reflectedVy,
+    if (!paddleHit) {
+      nextBalls[ballIndex] = currentBall;
+
+      return {
+        state: {
+          balls: nextBalls,
+          paddleOffsets,
+          lastHitter: currentLastHitter,
         },
-        paddleOffsets,
-        lastHitter: state.lastHitter,
-      },
-      missedWall: null,
-      missedPlayerId: null,
-    };
+        missedWall: wall.slot,
+        missedPlayerId: physicsActivePlayerIds[wall.slot] ?? null,
+        missedBallIndex: ballIndex,
+      };
+    }
+
+    currentBall = bounceFromPaddle(
+      currentBall,
+      wall,
+      paddleOffset,
+      collision.point,
+      config,
+    );
+
+    currentLastHitter = physicsActivePlayerIds[wall.slot] ?? null;
   }
 
-  const paddleOffset = paddleOffsets[wall.slot] ?? 0;
-
-  const relativeToCenter = {
-    x: collision.point.x - wall.center.x,
-
-    y: collision.point.y - wall.center.y,
-  };
-
-  const ballPositionOnWall = dot(relativeToCenter, wall.tangent);
-
-  const paddleHalf = config.paddleLength / 2;
-
-  const onWallSegment = Math.abs(ballPositionOnWall) <= wall.length / 2;
-
-  const paddleHit =
-    onWallSegment && Math.abs(ballPositionOnWall - paddleOffset) <= paddleHalf;
-
-  /**
-   * Ball crossed a player wall but did not hit its paddle.
-   */
-  if (!paddleHit) {
-    return {
-      state: {
-        ...state,
-        paddleOffsets,
-      },
-      missedWall: wall.slot,
-      missedPlayerId: physicsActivePlayerIds[wall.slot] ?? null,
-    };
-  }
-
-  /**
-   * Successful paddle hit.
-   *
-   * bounceFromPaddle() applies SPEED_INCREMENT here.
-   */
-  const bouncedBall = bounceFromPaddle(
-    state.ball,
-    wall,
-    paddleOffset,
-    collision.point,
-    config,
-  );
+  nextBalls[ballIndex] = currentBall;
 
   return {
     state: {
-      ball: bouncedBall,
+      balls: nextBalls,
       paddleOffsets,
-      lastHitter: physicsActivePlayerIds[wall.slot] ?? null,
+      lastHitter: currentLastHitter,
     },
     missedWall: null,
     missedPlayerId: null,
+    missedBallIndex: null,
   };
 };
 
 /**
- * Pure physics step.
+ * Pure multi-ball physics step.
  *
- * Phase 4:
- *
- * 1. Calculate how far the ball would travel during this frame.
- * 2. Compare that distance with a threshold derived from paddle length.
- * 3. Split the frame into smaller steps when necessary.
- * 4. Run collision detection after EVERY sub-step.
- *
- * This prevents a fast ball from jumping completely through a paddle
- * between two collision checks.
+ * Every ball uses the exact same single-ball physics path. Balls never
+ * participate in collision checks against one another, so they pass through.
  */
 export const updatePhysics = (
   state: GameState,
@@ -656,46 +544,86 @@ export const updatePhysics = (
 ): PhysicsResult => {
   "worklet";
 
-  /**
-   * Preserve the existing frame-time safety clamp.
-   */
   const dt = clamp(deltaTime, 0, 0.033);
+  let paddleOffsets = [...state.paddleOffsets];
+  let nextBalls = [...state.balls];
 
-  if (dt <= 0) {
-    return {
-      state,
-      missedWall: null,
-      missedPlayerId: null,
-    };
+  /**
+   * Bot paddles are shared by all balls, so update each bot exactly once per
+   * rendered physics tick. Pick the ball that is closest to that wall while
+   * moving toward it. This avoids multiplying bot movement by ball count.
+   */
+  for (
+    let wallIndex = 0;
+    wallIndex < physicsActivePlayerIds.length;
+    wallIndex++
+  ) {
+    if (
+      wallIndex === findActiveWallIndex(localPlayerId, physicsActivePlayerIds)
+    ) {
+      continue;
+    }
+
+    const wall = physicsGeometry.walls[wallIndex];
+    let targetBall = nextBalls[0];
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (let i = 0; i < nextBalls.length; i++) {
+      const candidate = nextBalls[i];
+      const relative = {
+        x: candidate.x - wall.center.x,
+        y: candidate.y - wall.center.y,
+      };
+      const distance = dot(relative, wall.outward);
+      const movingTowardWall =
+        dot({ x: candidate.vx, y: candidate.vy }, wall.outward) > 0;
+
+      if (movingTowardWall && distance < bestDistance) {
+        bestDistance = distance;
+        targetBall = candidate;
+      }
+    }
+
+    paddleOffsets[wallIndex] = updateBotPaddle(
+      paddleOffsets[wallIndex] ?? 0,
+      wall,
+      targetBall,
+      dt,
+      config,
+    );
   }
 
-  const speed = magnitude(state.ball.vx, state.ball.vy);
+  const localWallIndex = findActiveWallIndex(
+    localPlayerId,
+    physicsActivePlayerIds,
+  );
 
-  /**
-   * The number of collision checks is based on:
-   *
-   *     ball travel distance
-   *     --------------------
-   *     paddleLength / 3
-   *
-   * Therefore the threshold automatically follows paddle size.
-   */
-  const substeps = getSubstepCount(speed, dt, config.paddleLength);
+  if (localWallIndex >= 0) {
+    const localWall = physicsGeometry.walls[localWallIndex];
+    const localMaxOffset = Math.max(
+      0,
+      localWall.length / 2 - config.paddleLength / 2,
+    );
 
-  const substepDt = dt / substeps;
+    paddleOffsets[localWallIndex] = clamp(
+      localPaddleOffset,
+      -localMaxOffset,
+      localMaxOffset,
+    );
+  }
 
-  let currentState = state;
+  for (let ballIndex = 0; ballIndex < nextBalls.length; ballIndex++) {
+    const ballState: GameState = {
+      balls: nextBalls,
+      paddleOffsets,
+      lastHitter: state.lastHitter,
+    };
 
-  /**
-   * Run collision detection after every sub-step.
-   *
-   * This also allows the ball to hit more than one wall during a
-   * single rendered frame if it is travelling fast enough.
-   */
-  for (let step = 0; step < substeps; step++) {
-    const result = updatePhysicsStep(
-      currentState,
-      substepDt,
+    const result = updateSingleBall(
+      nextBalls[ballIndex],
+      ballIndex,
+      ballState,
+      dt,
       localPlayerId,
       localPaddleOffset,
       config,
@@ -704,17 +632,33 @@ export const updatePhysics = (
       ignoredWallSlot,
     );
 
-    if (result.missedWall !== null || result.missedPlayerId !== null) {
-      return result;
-    }
+    nextBalls = result.state.balls;
+    paddleOffsets = result.state.paddleOffsets;
+    state = { ...state, lastHitter: result.state.lastHitter };
 
-    currentState = result.state;
+    if (result.missedWall !== null || result.missedPlayerId !== null) {
+      return {
+        state: {
+          balls: nextBalls,
+          paddleOffsets,
+          lastHitter: result.state.lastHitter,
+        },
+        missedWall: result.missedWall,
+        missedPlayerId: result.missedPlayerId,
+        missedBallIndex: result.missedBallIndex,
+      };
+    }
   }
 
   return {
-    state: currentState,
+    state: {
+      balls: nextBalls,
+      paddleOffsets,
+      lastHitter: state.lastHitter,
+    },
     missedWall: null,
     missedPlayerId: null,
+    missedBallIndex: null,
   };
 };
 
@@ -741,7 +685,7 @@ export const createInitialState = (
   "worklet";
 
   return {
-    ball: createBall(geometry, speed, angle),
+    balls: [createBall(geometry, speed, angle)],
     paddleOffsets: new Array(geometry.n).fill(0),
     lastHitter: null,
   };

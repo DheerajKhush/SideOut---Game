@@ -4,8 +4,8 @@ import {
   Pressable,
   StyleSheet,
   Text,
-  View,
   useWindowDimensions,
+  View,
 } from "react-native";
 
 import {
@@ -24,6 +24,10 @@ import {
 import {
   createBall,
   createInitialState,
+  INITIAL_SPAWN_DELAY_MS,
+  MAX_BALL_COUNT,
+  MAX_BALL_SPEED,
+  SPAWN_INTERVAL_MS,
   updatePhysics,
   type PhysicsConfig,
 } from "@/game/engine/physics";
@@ -141,6 +145,10 @@ export default function GameScreen() {
 
   const gameOverShared = useSharedValue(false);
 
+  /** Round-time accumulator used for additional-ball spawning. */
+  const spawnElapsedMs = useSharedValue(0);
+  const nextSpawnAtMs = useSharedValue(INITIAL_SPAWN_DELAY_MS);
+
   /** Blocks duplicate miss events while JS applies the elimination. */
   const missPendingShared = useSharedValue(false);
 
@@ -212,15 +220,18 @@ export default function GameScreen() {
         // the smaller arena, guarantee the ball is valid in the new geometry.
         // Normal transitions keep the ball inside; this is only a safety
         // recovery for the open-edge case.
-        let handoffBall = oldState.ball;
+        const handoffBalls = [...oldState.balls];
 
-        if (newGeometry !== null) {
+        for (let ballIndex = 0; ballIndex < handoffBalls.length; ballIndex++) {
+          const ball = handoffBalls[ballIndex];
           let outsideNewGeometry = false;
 
-          for (let i = 0; i < newGeometry.walls.length; i++) {
-            const wall = newGeometry.walls[i];
-            const relativeX = handoffBall.x - wall.start.x;
-            const relativeY = handoffBall.y - wall.start.y;
+          const wallCount = newGeometry ? newGeometry.walls.length : 0;
+
+          for (let i = 0; i < wallCount; i++) {
+            const wall = newGeometry!.walls[i];
+            const relativeX = ball.x - wall.start.x;
+            const relativeY = ball.y - wall.start.y;
             const distance =
               relativeX * wall.outward.x + relativeY * wall.outward.y;
 
@@ -230,21 +241,19 @@ export default function GameScreen() {
             }
           }
 
-          if (outsideNewGeometry) {
-            const speed = Math.sqrt(
-              handoffBall.vx * handoffBall.vx + handoffBall.vy * handoffBall.vy,
-            );
-            const safeSpeed = Math.max(1, Math.min(speed, CONFIG.maxBallSpeed));
+          if (outsideNewGeometry && newGeometry !== null) {
+            const speed = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+            const safeSpeed = Math.max(1, Math.min(speed, MAX_BALL_SPEED));
             const directionLength = Math.sqrt(
-              handoffBall.vx * handoffBall.vx + handoffBall.vy * handoffBall.vy,
+              ball.vx * ball.vx + ball.vy * ball.vy,
             );
 
             const directionX =
-              directionLength > 0.0001 ? handoffBall.vx / directionLength : 1;
+              directionLength > 0.0001 ? ball.vx / directionLength : 1;
             const directionY =
-              directionLength > 0.0001 ? handoffBall.vy / directionLength : 0;
+              directionLength > 0.0001 ? ball.vy / directionLength : 0;
 
-            handoffBall = {
+            handoffBalls[ballIndex] = {
               x: newGeometry.center.x,
               y: newGeometry.center.y,
               vx: directionX * safeSpeed,
@@ -255,7 +264,7 @@ export default function GameScreen() {
 
         gameState.value = {
           ...oldState,
-          ball: handoffBall,
+          balls: handoffBalls,
           paddleOffsets: mappedOffsets,
         };
 
@@ -280,7 +289,7 @@ export default function GameScreen() {
    * unchanged. The only addition is that the old geometry is retained for a
    * 500 ms visual/physics handoff before the new geometry becomes physical.
    */
-  const handleMiss = (playerId: number) => {
+  const handleMiss = (playerId: number, missedBallIndex: number) => {
     // A terminal state or an already queued miss must never fire twice.
     if (gameOverShared.value || !missPendingShared.value) {
       return;
@@ -302,6 +311,22 @@ export default function GameScreen() {
     setLives(nextLives);
 
     if (nextLives[playerId] > 0) {
+      const balls = [...gameState.value.balls];
+
+      if (balls[missedBallIndex]) {
+        balls[missedBallIndex] = createBall(
+          CONFIG.geometry,
+          CONFIG.initialBallSpeed,
+          randomLaunchAngle(),
+        );
+      }
+
+      gameState.value = {
+        ...gameState.value,
+        balls,
+        lastHitter: null,
+      };
+
       missPendingShared.value = false;
       return;
     }
@@ -344,19 +369,6 @@ export default function GameScreen() {
               width / 2,
               height / 2,
             );
-
-    /**
-     * Keep the existing Phase 3a center relaunch. Importantly, it is created
-     * against the old geometry because physics remains on that geometry until
-     * the 500 ms handoff completes. All generated geometries share a center.
-     */
-    if (nextPlayers.length > 1) {
-      gameState.value = createInitialState(
-        oldGeometry,
-        CONFIG.initialBallSpeed,
-        randomLaunchAngle(),
-      );
-    }
 
     startGeometryTransition(
       oldGeometry,
@@ -443,6 +455,35 @@ export default function GameScreen() {
 
     if (delta == null) return;
 
+    spawnElapsedMs.value += delta;
+
+    if (
+      !transitionActiveShared.value &&
+      gameState.value.balls.length < MAX_BALL_COUNT &&
+      spawnElapsedMs.value >= nextSpawnAtMs.value
+    ) {
+      const balls = [...gameState.value.balls];
+
+      while (
+        balls.length < MAX_BALL_COUNT &&
+        spawnElapsedMs.value >= nextSpawnAtMs.value
+      ) {
+        balls.push(
+          createBall(
+            CONFIG.geometry,
+            CONFIG.initialBallSpeed,
+            randomLaunchAngle(),
+          ),
+        );
+        nextSpawnAtMs.value += SPAWN_INTERVAL_MS;
+      }
+
+      gameState.value = {
+        ...gameState.value,
+        balls,
+      };
+    }
+
     let physicsGeometry = CONFIG.geometry;
     let physicsActivePlayerIds = CONFIG.activePlayerIds;
     let ignoredWallSlot = -1;
@@ -485,23 +526,27 @@ export default function GameScreen() {
       }
 
       /**
-       * Preserve the Phase 3a center relaunch. The ball is now running from
-       * the shared center while the old boundary remains physical for the
-       * transition. The removed wall is already an open boundary.
+       * Relaunch only the ball that missed. All other balls keep their
+       * current trajectory and continue using the same physics path.
        */
-      const newBall = createBall(
-        physicsGeometry,
-        CONFIG.initialBallSpeed,
-        randomLaunchAngle(),
-      );
+      const nextBalls = [...result.state.balls];
+      const missedBallIndex = result.missedBallIndex ?? 0;
+
+      if (nextBalls[missedBallIndex]) {
+        nextBalls[missedBallIndex] = createBall(
+          physicsGeometry,
+          CONFIG.initialBallSpeed,
+          randomLaunchAngle(),
+        );
+      }
 
       gameState.value = {
         ...result.state,
-        ball: newBall,
+        balls: nextBalls,
         lastHitter: null,
       };
 
-      runOnJS(handleMiss)(result.missedPlayerId);
+      runOnJS(handleMiss)(result.missedPlayerId, missedBallIndex);
       return;
     }
 
