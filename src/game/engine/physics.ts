@@ -18,12 +18,6 @@ export const MAX_BALL_SPEED = 650;
  */
 export const SHRINK_START_MS = 60_000;
 export const SHRINK_RATE = 6;
-
-/**
- * Never allow the arena to collapse below this radius.
- *
- * This is deliberately independent from wall-count elimination.
- */
 export const MIN_ARENA_RADIUS = 120;
 
 /** Collision sub-step threshold as a fraction of paddle length. */
@@ -34,6 +28,14 @@ export interface Ball {
   y: number;
   vx: number;
   vy: number;
+
+  /**
+   * Stable player id of the last player who hit this ball.
+   *
+   * null = freshly spawned/relaunched ball that has not
+   * been hit by a paddle yet.
+   */
+  lastHitBySlot: number | null;
 }
 
 export interface GameState {
@@ -47,7 +49,11 @@ export interface GameState {
 
   /**
    * Stable player id of the last player who successfully
-   * hit the ball. This is a player id, not a current wall index.
+   * hit any ball.
+   *
+   * This remains for scoring/gameplay.
+   *
+   * Per-ball trail ownership is stored on Ball.lastHitBySlot.
    */
   lastHitter: number | null;
 }
@@ -63,11 +69,7 @@ export interface PhysicsConfig {
 
   ballRadius: number;
 
-  /**
-   * These are BASE values.
-   *
-   * updatePhysics applies the current arenaScale every tick.
-   */
+  /** BASE paddle dimensions. */
   paddleLength: number;
   paddleThickness: number;
 
@@ -77,10 +79,6 @@ export interface PhysicsConfig {
   botMaxSpeed: number;
   botReactionDeadZone: number;
 
-  /**
-   * Additional angle applied based on
-   * where the ball hits the paddle.
-   */
   maxBounceAngle: number;
 }
 
@@ -118,8 +116,13 @@ const magnitude = (x: number, y: number): number => {
 const normalizeAngle = (angle: number): number => {
   "worklet";
 
-  while (angle > Math.PI) angle -= Math.PI * 2;
-  while (angle < -Math.PI) angle += Math.PI * 2;
+  while (angle > Math.PI) {
+    angle -= Math.PI * 2;
+  }
+
+  while (angle < -Math.PI) {
+    angle += Math.PI * 2;
+  }
 
   return angle;
 };
@@ -140,12 +143,10 @@ const findActiveWallIndex = (
 };
 
 /**
- * Scale the geometry around its fixed center.
+ * Scale a geometry around its fixed center.
  *
- * This is NOT wall-count resizing.
- *
- * The number of walls and their topology remain exactly the same.
- * Only the radius/size changes.
+ * This changes radius/size only.
+ * It does NOT change vertex count.
  */
 export const scalePolygonGeometry = (
   geometry: PolygonGeometry,
@@ -159,6 +160,7 @@ export const scalePolygonGeometry = (
 
   const scalePoint = (point: Vec2): Vec2 => ({
     x: center.x + (point.x - center.x) * safeScale,
+
     y: center.y + (point.y - center.y) * safeScale,
   });
 
@@ -177,7 +179,7 @@ export const scalePolygonGeometry = (
   };
 };
 
-/** Standard vector reflection: v' = v - 2(v.n)n. */
+/** Standard vector reflection. */
 export const reflectVelocity = (
   vx: number,
   vy: number,
@@ -190,6 +192,7 @@ export const reflectVelocity = (
 
   return {
     x: vx - 2 * projection * normalX,
+
     y: vy - 2 * projection * normalY,
   };
 };
@@ -198,10 +201,12 @@ const rotateVector = (vector: Vec2, angle: number): Vec2 => {
   "worklet";
 
   const cos = Math.cos(angle);
+
   const sin = Math.sin(angle);
 
   return {
     x: vector.x * cos - vector.y * sin,
+
     y: vector.x * sin + vector.y * cos,
   };
 };
@@ -217,7 +222,7 @@ const findEarliestCollision = (
   dt: number,
   geometry: PolygonGeometry,
   radius: number,
-  ignoredWallSlot: number = -1,
+  ignoredWallSlot = -1,
 ): WallCollision | null => {
   "worklet";
 
@@ -228,40 +233,37 @@ const findEarliestCollision = (
 
   const next = {
     x: ball.x + ball.vx * dt,
+
     y: ball.y + ball.vy * dt,
   };
 
   let earliest: WallCollision | null = null;
 
   for (let i = 0; i < geometry.walls.length; i++) {
-    /**
-     * During a shatter transition the removed wall is physically gone.
-     * The renderer may still be animating the remaining walls, but the ball
-     * must be allowed to pass through the old removed edge.
-     */
-    if (i === ignoredWallSlot) continue;
+    if (i === ignoredWallSlot) {
+      continue;
+    }
 
     const wall = geometry.walls[i];
 
     const currentRelative = {
       x: current.x - wall.start.x,
+
       y: current.y - wall.start.y,
     };
 
     const nextRelative = {
       x: next.x - wall.start.x,
+
       y: next.y - wall.start.y,
     };
 
     const currentDistance = dot(currentRelative, wall.outward);
+
     const nextDistance = dot(nextRelative, wall.outward);
 
     const collisionDistance = -radius;
 
-    /**
-     * Collision occurs only when the ball crosses the wall's collision
-     * plane from inside the arena to outside it.
-     */
     if (
       currentDistance >= collisionDistance ||
       nextDistance < collisionDistance
@@ -283,6 +285,7 @@ const findEarliestCollision = (
 
     const point = {
       x: current.x + (next.x - current.x) * time,
+
       y: current.y + (next.y - current.y) * time,
     };
 
@@ -323,6 +326,7 @@ const updateBotPaddle = (
   if (movingTowardWall) {
     const ballRelative = {
       x: ball.x - wall.center.x,
+
       y: ball.y - wall.center.y,
     };
 
@@ -336,6 +340,7 @@ const updateBotPaddle = (
   }
 
   const maxMovement = config.botMaxSpeed * dt;
+
   const movement = clamp(distance, -maxMovement, maxMovement);
 
   return clamp(currentOffset + movement, -maxOffset, maxOffset);
@@ -363,16 +368,11 @@ const bounceFromPaddle = (
     MAX_BALL_SPEED,
   );
 
-  /**
-   * Phase 4a:
-   * every successful paddle hit increases speed.
-   *
-   * This remains completely independent from arena shrinking.
-   */
   const speed = Math.min(currentSpeed + SPEED_INCREMENT, MAX_BALL_SPEED);
 
   const relative = {
     x: collisionPoint.x - wall.center.x,
+
     y: collisionPoint.y - wall.center.y,
   };
 
@@ -404,22 +404,24 @@ const bounceFromPaddle = (
     relativeAngle,
   );
 
+  /**
+   * Preserve lastHitBySlot here.
+   *
+   * The caller updates it after a successful hit.
+   */
   return {
     x: collisionPoint.x - wall.outward.x * (config.ballRadius + 0.5),
 
     y: collisionPoint.y - wall.outward.y * (config.ballRadius + 0.5),
 
     vx: finalDirection.x * speed,
+
     vy: finalDirection.y * speed,
+
+    lastHitBySlot: ball.lastHitBySlot,
   };
 };
 
-/**
- * Collision sub-stepping.
- *
- * Uses the CURRENT scaled paddle length, so collision safety
- * remains correct as the arena shrinks.
- */
 const getSubstepCount = (
   speed: number,
   dt: number,
@@ -476,16 +478,18 @@ const updateSingleBall = (
   if (localWallIndex >= 0) {
     const localWall = physicsGeometry.walls[localWallIndex];
 
-    const localMaxOffset = Math.max(
-      0,
-      localWall.length / 2 - config.paddleLength / 2,
-    );
+    if (localWall) {
+      const localMaxOffset = Math.max(
+        0,
+        localWall.length / 2 - config.paddleLength / 2,
+      );
 
-    paddleOffsets[localWallIndex] = clamp(
-      localPaddleOffset,
-      -localMaxOffset,
-      localMaxOffset,
-    );
+      paddleOffsets[localWallIndex] = clamp(
+        localPaddleOffset,
+        -localMaxOffset,
+        localMaxOffset,
+      );
+    }
   }
 
   const substeps = getSubstepCount(
@@ -514,7 +518,10 @@ const updateSingleBall = (
         y: currentBall.y + currentBall.vy * substepDt,
 
         vx: currentBall.vx,
+
         vy: currentBall.vy,
+
+        lastHitBySlot: currentBall.lastHitBySlot,
       };
 
       continue;
@@ -523,8 +530,7 @@ const updateSingleBall = (
     const wall = collision.wall;
 
     /**
-     * Passive boundaries in the terminal rectangle
-     * reflect without counting as a paddle hit.
+     * Passive boundaries in the 2-player rectangle.
      */
     if (wall.slot >= physicsActivePlayerIds.length) {
       const reflected = reflectVelocity(
@@ -573,6 +579,8 @@ const updateSingleBall = (
 
         vx: reflectedVx,
         vy: reflectedVy,
+
+        lastHitBySlot: currentBall.lastHitBySlot,
       };
 
       continue;
@@ -622,6 +630,22 @@ const updateSingleBall = (
       config,
     );
 
+    /**
+     * IMPORTANT:
+     *
+     * This is the only place that changes the ball's
+     * last-hit slot.
+     *
+     * The metadata belongs to THIS ball.
+     */
+    currentBall = {
+      ...currentBall,
+      lastHitBySlot: physicsActivePlayerIds[wall.slot] ?? null,
+    };
+
+    /**
+     * Existing global lastHitter remains for scoring/gameplay.
+     */
     currentLastHitter = physicsActivePlayerIds[wall.slot] ?? null;
   }
 
@@ -643,13 +667,7 @@ const updateSingleBall = (
 /**
  * Pure multi-ball physics step.
  *
- * `arenaScale` is the CURRENT continuous-shrink scale.
- *
- * Important:
- * - wall count comes from physicsGeometry
- * - radius comes from scaling physicsGeometry
- * - paddle length is scaled independently from the base config
- * - ball speed remains independent from arena shrinking
+ * arenaScale is the CURRENT continuous-shrink scale.
  */
 export const updatePhysics = (
   state: GameState,
@@ -659,8 +677,8 @@ export const updatePhysics = (
   config: PhysicsConfig,
   physicsGeometry: PolygonGeometry = config.geometry,
   physicsActivePlayerIds: number[] = config.activePlayerIds,
-  ignoredWallSlot: number = -1,
-  arenaScale: number = 1,
+  ignoredWallSlot = -1,
+  arenaScale = 1,
 ): PhysicsResult => {
   "worklet";
 
@@ -669,21 +687,15 @@ export const updatePhysics = (
   const safeArenaScale = Math.max(0.01, arenaScale);
 
   /**
-   * CURRENT shrink-scaled geometry.
+   * Current shrinking geometry.
    *
-   * The incoming physicsGeometry already represents the current
-   * wall-count state (old geometry during transition, new geometry
-   * after transition).
-   *
-   * This operation only changes radius.
+   * Vertex count comes from physicsGeometry.
+   * Radius comes from safeArenaScale.
    */
   const currentGeometry = scalePolygonGeometry(physicsGeometry, safeArenaScale);
 
   /**
-   * Paddle length shrinks with the arena.
-   *
-   * Because wall.length is scaled by the exact same factor,
-   * paddleLength / wall.length stays constant.
+   * Paddle length shrinks proportionally with wall length.
    */
   const currentPaddleLength = config.paddleLength * safeArenaScale;
 
@@ -698,8 +710,7 @@ export const updatePhysics = (
   let nextBalls = [...state.balls];
 
   /**
-   * Bot paddles are shared by all balls.
-   * Update each bot exactly once per physics tick.
+   * Update each bot once per physics tick.
    */
   for (
     let wallIndex = 0;
@@ -851,8 +862,15 @@ export const createBall = (
   return {
     x: geometry.center.x,
     y: geometry.center.y,
+
     vx: Math.cos(angle) * speed,
+
     vy: Math.sin(angle) * speed,
+
+    /**
+     * Fresh ball = neutral trail.
+     */
+    lastHitBySlot: null,
   };
 };
 

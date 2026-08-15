@@ -18,11 +18,43 @@ import {
 
 import type { PolygonGeometry, PolygonWall, Vec2 } from "@/game/engine/polygon";
 
+/**
+ * Single persistent player color system.
+ *
+ * Stable player id -> stable color.
+ *
+ * This is reused by:
+ * - paddle/wall visuals
+ * - ball trails
+ */
+const PLAYER_SLOT_COLORS = [
+  "#67FFD1",
+  "#FF4D8D",
+  "#FFD166",
+  "#8B7CFF",
+  "#4DD9FF",
+  "#FF8A5B",
+  "#B8FF5A",
+  "#D98BFF",
+] as const;
+
+const NEUTRAL_TRAIL_COLOR = "#8BD8FF";
+
+const getPlayerSlotColor = (slot: number | null): string => {
+  "worklet";
+
+  if (slot === null || slot < 0) {
+    return NEUTRAL_TRAIL_COLOR;
+  }
+
+  return (
+    PLAYER_SLOT_COLORS[slot % PLAYER_SLOT_COLORS.length] ?? NEUTRAL_TRAIL_COLOR
+  );
+};
+
 interface GeometryTransition {
   oldGeometry: PolygonGeometry;
   oldActivePlayerIds: number[];
-
-  /** Angle of the player's wall before the shatter. */
   oldLocalWallAngle: number;
 }
 
@@ -30,29 +62,13 @@ interface Props {
   state: SharedValue<GameState>;
   playerPaddleOffset: SharedValue<number>;
   config: PhysicsConfig;
-
-  /** Stable player id, not the current wall index. */
   localSlot: number;
-
-  /** Lives indexed by stable player id. */
   lives: number[];
 
-  /**
-   * Present while/after a shatter.
-   *
-   * The transition still represents ONLY the wall-count change.
-   * arenaScale independently applies the continuous radius shrink.
-   */
   transition: GeometryTransition | null;
 
   transitionProgress: SharedValue<number>;
 
-  /**
-   * Current continuous arena radius scale.
-   *
-   * 1 = original radius.
-   * <1 = shrink-reduced radius.
-   */
   arenaScale: SharedValue<number>;
 }
 
@@ -73,6 +89,7 @@ const lerpVec = (a: Vec2, b: Vec2, t: number): Vec2 => {
 
   return {
     x: lerp(a.x, b.x, t),
+
     y: lerp(a.y, b.y, t),
   };
 };
@@ -169,6 +186,8 @@ interface WallVisualProps {
   wall: PolygonWall;
   oldWall: PolygonWall | null;
 
+  playerId: number;
+
   state: SharedValue<GameState>;
   playerPaddleOffset: SharedValue<number>;
 
@@ -188,6 +207,7 @@ interface WallVisualProps {
 const WallVisual = ({
   wall,
   oldWall,
+  playerId,
   state,
   playerPaddleOffset,
   paddleLength,
@@ -200,46 +220,21 @@ const WallVisual = ({
   arenaCenter,
 }: WallVisualProps) => {
   /**
-   * The child owns these hooks so the parent can change
-   * the number of walls after a shatter without changing
-   * the parent's hook count.
-   */
-
-  /**
-   * FIRST mechanism:
-   *
-   * oldWall -> wall is the Phase 3b wall-count transition.
+   * Phase 3b:
+   * old wall -> new wall.
    */
   const wallStart = useDerivedValue(() => {
     const t = transitionProgress.value;
 
-    const interpolated = lerpVec(
-      oldWall?.start ?? wall.start,
+    const interpolated = lerpVec(oldWall?.start ?? wall.start, wall.start, t);
 
-      wall.start,
-      t,
-    );
-
-    /**
-     * SECOND mechanism:
-     *
-     * Continuous radius shrink.
-     *
-     * The already-interpolated wall is scaled around
-     * the arena center.
-     */
     return scalePoint(interpolated, arenaCenter, arenaScale.value);
   });
 
   const wallEnd = useDerivedValue(() => {
     const t = transitionProgress.value;
 
-    const interpolated = lerpVec(
-      oldWall?.end ?? wall.end,
-
-      wall.end,
-      t,
-    );
+    const interpolated = lerpVec(oldWall?.end ?? wall.end, wall.end, t);
 
     return scalePoint(interpolated, arenaCenter, arenaScale.value);
   });
@@ -249,7 +244,6 @@ const WallVisual = ({
 
     const interpolated = lerpVec(
       oldWall?.center ?? wall.center,
-
       wall.center,
       t,
     );
@@ -261,12 +255,7 @@ const WallVisual = ({
     const t = transitionProgress.value;
 
     return normalizeVec(
-      lerpVec(
-        oldWall?.tangent ?? wall.tangent,
-
-        wall.tangent,
-        t,
-      ),
+      lerpVec(oldWall?.tangent ?? wall.tangent, wall.tangent, t),
     );
   });
 
@@ -274,33 +263,18 @@ const WallVisual = ({
     const t = transitionProgress.value;
 
     return normalizeVec(
-      lerpVec(
-        oldWall?.outward ?? wall.outward,
-
-        wall.outward,
-        t,
-      ),
+      lerpVec(oldWall?.outward ?? wall.outward, wall.outward, t),
     );
   });
 
   const wallAngle = useDerivedValue(() => {
     const t = transitionProgress.value;
 
-    return lerpAngle(
-      oldWall?.angle ?? wall.angle,
-
-      wall.angle,
-      t,
-    );
+    return lerpAngle(oldWall?.angle ?? wall.angle, wall.angle, t);
   });
 
   /**
-   * Paddle offsets are already expressed in CURRENT
-   * physics units because physics scales paddle length
-   * and wall length on every tick.
-   *
-   * Therefore we do NOT multiply paddleOffset by arenaScale
-   * again here.
+   * Paddle offset remains in current arena coordinates.
    */
   const paddleOffset = useDerivedValue(() => {
     if (isLocal) {
@@ -328,17 +302,13 @@ const WallVisual = ({
     y: wallCenter.value.y + wallTangent.value.y * paddleOffset.value,
   }));
 
-  const paddleCenterX = useDerivedValue(() => paddleCenter.value.x);
-
-  const paddleCenterY = useDerivedValue(() => paddleCenter.value.y);
-
   const paddleStart = useDerivedValue(() => {
     const half = currentPaddleLength.value / 2;
 
     return {
-      x: paddleCenterX.value - wallTangent.value.x * half,
+      x: paddleCenter.value.x - wallTangent.value.x * half,
 
-      y: paddleCenterY.value - wallTangent.value.y * half,
+      y: paddleCenter.value.y - wallTangent.value.y * half,
     };
   });
 
@@ -346,9 +316,9 @@ const WallVisual = ({
     const half = currentPaddleLength.value / 2;
 
     return {
-      x: paddleCenterX.value + wallTangent.value.x * half,
+      x: paddleCenter.value.x + wallTangent.value.x * half,
 
-      y: paddleCenterY.value + wallTangent.value.y * half,
+      y: paddleCenter.value.y + wallTangent.value.y * half,
     };
   });
 
@@ -360,10 +330,6 @@ const WallVisual = ({
     () => wallCenter.value.y + wallOutward.value.y * (24 * arenaScale.value),
   );
 
-  /**
-   * Skia's Group transform prop expects the transform array itself
-   * to be animated, rather than a DerivedValue nested inside the array.
-   */
   const labelTransform = useDerivedValue(() => [
     {
       rotate: -(Math.PI / 2 - wallAngle.value),
@@ -398,11 +364,14 @@ const WallVisual = ({
       wallTangent.value.y * (42 * arenaScale.value),
   );
 
-  const primaryColor = isLocal ? "#67FFD1" : "#FF4D8D";
+  /**
+   * SAME persistent color system used by ball trails.
+   */
+  const primaryColor = getPlayerSlotColor(playerId);
 
-  const secondaryColor = isLocal ? "#18CFA5" : "#D92768";
+  const secondaryColor = primaryColor;
 
-  const wallColor = isLocal ? "#35FFD0" : "#32435C";
+  const wallColor = primaryColor;
 
   return (
     <>
@@ -451,7 +420,7 @@ const WallVisual = ({
       <Line
         p1={paddleStart}
         p2={paddleEnd}
-        color={isLocal ? "#D8FFF4" : "#FFD5E4"}
+        color="#FFFFFF"
         strokeWidth={3}
         opacity={0.9}
         strokeCap="round"
@@ -460,14 +429,19 @@ const WallVisual = ({
       {isLocal && (
         <>
           <Circle
-            cx={paddleCenterX}
-            cy={paddleCenterY}
+            cx={paddleCenter.x}
+            cy={paddleCenter.y}
             r={15}
-            color="#67FFD1"
+            color={primaryColor}
             opacity={0.06}
           />
 
-          <Circle cx={paddleCenterX} cy={paddleCenterY} r={3} color="#FFFFFF" />
+          <Circle
+            cx={paddleCenter.x}
+            cy={paddleCenter.y}
+            r={3}
+            color="#FFFFFF"
+          />
         </>
       )}
 
@@ -541,8 +515,19 @@ const BallVisual = ({ state, ballIndex, ballRadius }: BallVisualProps) => {
 
     return {
       x: ball.vx / speed,
+
       y: ball.vy / speed,
     };
+  });
+
+  /**
+   * Each ball independently reads its own
+   * lastHitBySlot.
+   */
+  const trailColor = useDerivedValue(() => {
+    const ball = state.value.balls[ballIndex];
+
+    return getPlayerSlotColor(ball?.lastHitBySlot ?? null);
   });
 
   const ballTail = useDerivedValue(() => {
@@ -564,7 +549,7 @@ const BallVisual = ({ state, ballIndex, ballRadius }: BallVisualProps) => {
       <Line
         p1={ballTail}
         p2={ballPosition}
-        color="#48BFFF"
+        color={trailColor}
         strokeWidth={18}
         opacity={0.025}
         strokeCap="round"
@@ -573,7 +558,7 @@ const BallVisual = ({ state, ballIndex, ballRadius }: BallVisualProps) => {
       <Line
         p1={ballTail}
         p2={ballPosition}
-        color="#48BFFF"
+        color={trailColor}
         strokeWidth={10}
         opacity={0.055}
         strokeCap="round"
@@ -582,17 +567,17 @@ const BallVisual = ({ state, ballIndex, ballRadius }: BallVisualProps) => {
       <Line
         p1={ballTail}
         p2={ballPosition}
-        color="#8BD8FF"
+        color={trailColor}
         strokeWidth={4}
         opacity={0.16}
         strokeCap="round"
       />
 
-      <Circle cx={ballX} cy={ballY} r={26} color="#43BFFF" opacity={0.025} />
+      <Circle cx={ballX} cy={ballY} r={26} color={trailColor} opacity={0.025} />
 
-      <Circle cx={ballX} cy={ballY} r={17} color="#55C7FF" opacity={0.07} />
+      <Circle cx={ballX} cy={ballY} r={17} color={trailColor} opacity={0.07} />
 
-      <Circle cx={ballX} cy={ballY} r={11} color="#A8E5FF" opacity={0.18} />
+      <Circle cx={ballX} cy={ballY} r={11} color={trailColor} opacity={0.18} />
 
       <Circle cx={ballX} cy={ballY} r={ballRadius} color="#DDF7FF" />
 
@@ -617,7 +602,6 @@ export const GameRenderer = ({
 }: Props) => {
   const geometry = config.geometry;
 
-  /** Stable player id -> current wall index. */
   let localWallIndex = 0;
 
   for (let i = 0; i < config.activePlayerIds.length; i++) {
@@ -635,11 +619,6 @@ export const GameRenderer = ({
       ]
     : null;
 
-  /**
-   * Rotation belongs to the wall-count transition.
-   *
-   * Continuous shrinking does NOT alter rotation.
-   */
   const renderTransform = useDerivedValue(() => {
     const currentAngle = localWall?.angle ?? 0;
 
@@ -668,17 +647,12 @@ export const GameRenderer = ({
 
   const canvasHeight = geometry.center.y * 2;
 
-  /**
-   * Paddle size is based on the BASE config.
-   *
-   * WallVisual applies arenaScale to it.
-   */
-  const basePaddleLength = config.paddleLength;
   const centerOuterRadius = useDerivedValue(() => 22 * arenaScale.value);
 
   const centerMiddleRadius = useDerivedValue(() => 10 * arenaScale.value);
 
   const centerInnerRadius = useDerivedValue(() => 7 * arenaScale.value);
+
   return (
     <Canvas
       style={{
@@ -781,9 +755,10 @@ export const GameRenderer = ({
               key={`wall-${playerId}`}
               wall={wall}
               oldWall={oldWall}
+              playerId={playerId}
               state={state}
               playerPaddleOffset={playerPaddleOffset}
-              paddleLength={basePaddleLength}
+              paddleLength={config.paddleLength}
               paddleThickness={config.paddleThickness}
               isLocal={isLocal}
               label={isLocal ? "YOU" : `BOT ${playerId}`}
@@ -794,6 +769,7 @@ export const GameRenderer = ({
             />
           );
         })}
+
         <Circle
           cx={geometry.center.x}
           cy={geometry.center.y}
@@ -801,12 +777,14 @@ export const GameRenderer = ({
           color="#152338"
           opacity={0.18}
         />
+
         <Circle
           cx={geometry.center.x}
           cy={geometry.center.y}
           r={centerMiddleRadius}
           color="#0A111C"
         />
+
         <Circle
           cx={geometry.center.x}
           cy={geometry.center.y}
