@@ -1,9 +1,8 @@
 import GameScreen from "@/screens/game-screen";
-import { Text, View, StyleSheet } from "react-native";
+import { StyleSheet } from "react-native";
 
 export default function Index() {
-  return (
-   <GameScreen/>  );
+  return <GameScreen />;
 }
 
 const styles = StyleSheet.create({
