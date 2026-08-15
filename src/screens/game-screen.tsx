@@ -18,6 +18,7 @@ import {
   runOnJS,
   useFrameCallback,
   useSharedValue,
+  withTiming,
 } from "react-native-reanimated";
 
 import {
@@ -31,6 +32,7 @@ import {
   createPolygonGeometry,
   createTwoPlayerRectangleGeometry,
   createWinnerGeometry,
+  type PolygonGeometry,
 } from "@/game/engine/polygon";
 
 import { useGameStore } from "@/store/game-store";
@@ -39,6 +41,8 @@ import { GameRenderer } from "@/render/game-renderer";
 
 const PLAYER_COUNT = 8;
 const INITIAL_LIVES = 2;
+const SHATTER_TRANSITION_MS = 500;
+
 const createPlayerIds = () =>
   Array.from({ length: PLAYER_COUNT }, (_, index) => index);
 
@@ -47,6 +51,13 @@ const randomLaunchAngle = () => {
 
   return Math.random() * Math.PI * 2;
 };
+
+interface GeometryTransition {
+  oldGeometry: PolygonGeometry;
+  oldActivePlayerIds: number[];
+  /** Angle of the local player's wall immediately before the shatter. */
+  oldLocalWallAngle: number;
+}
 
 export default function GameScreen() {
   const { width, height } = useWindowDimensions();
@@ -57,6 +68,10 @@ export default function GameScreen() {
   const [lives, setLives] = useState<number[]>(() =>
     new Array(PLAYER_COUNT).fill(INITIAL_LIVES),
   );
+
+  /** Renderer-side snapshot used to morph old walls into new walls. */
+  const [geometryTransition, setGeometryTransition] =
+    useState<GeometryTransition | null>(null);
 
   const radius = Math.min(width, height) * 0.42;
 
@@ -111,7 +126,19 @@ export default function GameScreen() {
   /** Stable player id used by the UI-thread physics loop. */
   const localPlayerIdShared = useSharedValue(0);
 
-  /** No resize animation in this phase. */
+  /** Shared transition state consumed by the UI-thread physics loop. */
+  const transitionActiveShared = useSharedValue(false);
+  const transitionProgress = useSharedValue(1);
+  const transitionOldGeometryShared = useSharedValue<PolygonGeometry | null>(
+    null,
+  );
+  const transitionOldActivePlayerIdsShared = useSharedValue<number[]>([]);
+  const transitionNewGeometryShared = useSharedValue<PolygonGeometry | null>(
+    null,
+  );
+  const transitionNewActivePlayerIdsShared = useSharedValue<number[]>([]);
+  const transitionRemovedWallSlotShared = useSharedValue(-1);
+
   const gameOverShared = useSharedValue(false);
 
   /** Blocks duplicate miss events while JS applies the elimination. */
@@ -121,12 +148,137 @@ export default function GameScreen() {
     useGameStore.getState().addPoint(playerId);
   };
 
+  const startGeometryTransition = (
+    oldGeometry: PolygonGeometry,
+    oldActivePlayerIds: number[],
+    nextGeometry: PolygonGeometry,
+    nextActivePlayerIds: number[],
+    removedPlayerId: number,
+    oldLocalWallAngle: number,
+  ) => {
+    const removedWallSlot = oldActivePlayerIds.indexOf(removedPlayerId);
+
+    transitionOldGeometryShared.value = oldGeometry;
+    transitionOldActivePlayerIdsShared.value = [...oldActivePlayerIds];
+    transitionNewGeometryShared.value = nextGeometry;
+    transitionNewActivePlayerIdsShared.value = [...nextActivePlayerIds];
+    transitionRemovedWallSlotShared.value = removedWallSlot;
+    transitionActiveShared.value = true;
+    transitionProgress.value = 0;
+
+    setGeometryTransition({
+      oldGeometry,
+      oldActivePlayerIds: [...oldActivePlayerIds],
+      oldLocalWallAngle,
+    });
+
+    transitionProgress.value = withTiming(
+      1,
+      { duration: SHATTER_TRANSITION_MS },
+      (finished) => {
+        if (!finished) return;
+
+        /**
+         * Physics has been using the old wall indices throughout the
+         * transition. Preserve each surviving player's paddle offset when
+         * switching the state array to the new wall indices.
+         */
+        const oldState = gameState.value;
+        const oldIds = transitionOldActivePlayerIdsShared.value;
+        const newIds = transitionNewActivePlayerIdsShared.value;
+        const oldOffsets = oldState.paddleOffsets;
+        const mappedOffsets = new Array(newIds.length).fill(0);
+
+        for (let newIndex = 0; newIndex < newIds.length; newIndex++) {
+          const playerId = newIds[newIndex];
+          let oldIndex = -1;
+
+          for (let i = 0; i < oldIds.length; i++) {
+            if (oldIds[i] === playerId) {
+              oldIndex = i;
+              break;
+            }
+          }
+
+          if (oldIndex >= 0) {
+            mappedOffsets[newIndex] = oldOffsets[oldIndex] ?? 0;
+          }
+        }
+
+        const newGeometry = transitionNewGeometryShared.value;
+
+        // The shattered wall is intentionally open during the transition, so
+        // the ball may have crossed that old edge. Before handing physics to
+        // the smaller arena, guarantee the ball is valid in the new geometry.
+        // Normal transitions keep the ball inside; this is only a safety
+        // recovery for the open-edge case.
+        let handoffBall = oldState.ball;
+
+        if (newGeometry !== null) {
+          let outsideNewGeometry = false;
+
+          for (let i = 0; i < newGeometry.walls.length; i++) {
+            const wall = newGeometry.walls[i];
+            const relativeX = handoffBall.x - wall.start.x;
+            const relativeY = handoffBall.y - wall.start.y;
+            const distance =
+              relativeX * wall.outward.x + relativeY * wall.outward.y;
+
+            if (distance < -CONFIG.ballRadius) {
+              outsideNewGeometry = true;
+              break;
+            }
+          }
+
+          if (outsideNewGeometry) {
+            const speed = Math.sqrt(
+              handoffBall.vx * handoffBall.vx + handoffBall.vy * handoffBall.vy,
+            );
+            const safeSpeed = Math.max(1, Math.min(speed, CONFIG.maxBallSpeed));
+            const directionLength = Math.sqrt(
+              handoffBall.vx * handoffBall.vx + handoffBall.vy * handoffBall.vy,
+            );
+
+            const directionX =
+              directionLength > 0.0001 ? handoffBall.vx / directionLength : 1;
+            const directionY =
+              directionLength > 0.0001 ? handoffBall.vy / directionLength : 0;
+
+            handoffBall = {
+              x: newGeometry.center.x,
+              y: newGeometry.center.y,
+              vx: directionX * safeSpeed,
+              vy: directionY * safeSpeed,
+            };
+          }
+        }
+
+        gameState.value = {
+          ...oldState,
+          ball: handoffBall,
+          paddleOffsets: mappedOffsets,
+        };
+
+        transitionActiveShared.value = false;
+        transitionRemovedWallSlotShared.value = -1;
+        transitionOldGeometryShared.value = null;
+        transitionOldActivePlayerIdsShared.value = [];
+        transitionNewGeometryShared.value = null;
+        transitionNewActivePlayerIdsShared.value = [];
+
+        // The next miss is allowed only after the current shatter transition
+        // has completely handed physics to the new geometry.
+        missPendingShared.value = false;
+      },
+    );
+  };
+
   /**
    * Apply a miss on the JS thread.
    *
-   * The physics worklet has already relaunched the ball at the old polygon's
-   * center, so there is never a frame where the ball is left outside the new
-   * polygon. The old and new polygons share the same center.
+   * The existing Phase 3a lives/shatter/win decisions are intentionally kept
+   * unchanged. The only addition is that the old geometry is retained for a
+   * 500 ms visual/physics handoff before the new geometry becomes physical.
    */
   const handleMiss = (playerId: number) => {
     // A terminal state or an already queued miss must never fire twice.
@@ -138,6 +290,12 @@ export default function GameScreen() {
       missPendingShared.value = false;
       return;
     }
+
+    const oldGeometry = CONFIG.geometry;
+    const oldActivePlayerIds = [...activePlayers];
+    const oldLocalPlayerId = localPlayerIdShared.value;
+    const oldLocalWallIndex = oldActivePlayerIds.indexOf(oldLocalPlayerId);
+    const oldLocalWallAngle = oldGeometry.walls[oldLocalWallIndex]?.angle ?? 0;
 
     const nextLives = [...lives];
     nextLives[playerId] = Math.max(0, nextLives[playerId] - 1);
@@ -175,17 +333,11 @@ export default function GameScreen() {
       gestureStartOffset.value = 0;
     }
 
-    /**
-     * Phase 3 intentionally chooses the simplest safe re-clamp strategy:
-     * restart the single in-flight ball at the polygon center.
-     *
-     * Every generated polygon has the same center, so the ball is guaranteed
-     * to be valid in the new arena without any edge projection logic.
-     */
-    if (nextPlayers.length > 1) {
-      const nextGeometry =
-        nextPlayers.length === 2
-          ? createTwoPlayerRectangleGeometry(radius, width / 2, height / 2)
+    const nextGeometry =
+      nextPlayers.length === 2
+        ? createTwoPlayerRectangleGeometry(radius, width / 2, height / 2)
+        : nextPlayers.length === 1
+          ? createWinnerGeometry(radius, width / 2, height / 2)
           : createPolygonGeometry(
               nextPlayers.length,
               radius,
@@ -193,20 +345,34 @@ export default function GameScreen() {
               height / 2,
             );
 
+    /**
+     * Keep the existing Phase 3a center relaunch. Importantly, it is created
+     * against the old geometry because physics remains on that geometry until
+     * the 500 ms handoff completes. All generated geometries share a center.
+     */
+    if (nextPlayers.length > 1) {
       gameState.value = createInitialState(
-        nextGeometry,
+        oldGeometry,
         CONFIG.initialBallSpeed,
         randomLaunchAngle(),
       );
     }
 
+    startGeometryTransition(
+      oldGeometry,
+      oldActivePlayerIds,
+      nextGeometry,
+      nextPlayers,
+      playerId,
+      oldLocalWallAngle,
+    );
+
     setActivePlayers(nextPlayers);
 
-    // Only the 1-player winner state locks the game. The 2-player rectangle
-    // remains fully playable, so misses must continue to be accepted.
-    if (nextPlayers.length > 1) {
-      missPendingShared.value = false;
-    }
+    // Keep missPendingShared locked until the 500 ms transition finishes.
+    // This prevents a second shatter from starting while the first geometry
+    // handoff is still in flight. The 2-player rectangle remains playable
+    // immediately after that handoff.
   };
 
   /**
@@ -239,9 +405,19 @@ export default function GameScreen() {
     })
     .onUpdate((event) => {
       let localWallIndex = -1;
+      let activeIds = CONFIG.activePlayerIds;
+      let geometryForInput = CONFIG.geometry;
 
-      for (let i = 0; i < CONFIG.activePlayerIds.length; i++) {
-        if (CONFIG.activePlayerIds[i] === localPlayerIdShared.value) {
+      if (
+        transitionActiveShared.value &&
+        transitionOldGeometryShared.value !== null
+      ) {
+        activeIds = transitionOldActivePlayerIdsShared.value;
+        geometryForInput = transitionOldGeometryShared.value;
+      }
+
+      for (let i = 0; i < activeIds.length; i++) {
+        if (activeIds[i] === localPlayerIdShared.value) {
           localWallIndex = i;
           break;
         }
@@ -249,7 +425,7 @@ export default function GameScreen() {
 
       if (localWallIndex < 0) return;
 
-      const wall = CONFIG.geometry.walls[localWallIndex];
+      const wall = geometryForInput.walls[localWallIndex];
       const maxOffset = Math.max(0, wall.length / 2 - CONFIG.paddleLength / 2);
 
       const nextOffset = gestureStartOffset.value + event.translationX;
@@ -267,12 +443,33 @@ export default function GameScreen() {
 
     if (delta == null) return;
 
+    let physicsGeometry = CONFIG.geometry;
+    let physicsActivePlayerIds = CONFIG.activePlayerIds;
+    let ignoredWallSlot = -1;
+
+    /**
+     * During the visual morph, the smaller polygon is deliberately NOT used
+     * by physics. We continue simulating against the old polygon, except the
+     * wall that just shattered is skipped completely (open boundary).
+     */
+    if (
+      transitionActiveShared.value &&
+      transitionOldGeometryShared.value !== null
+    ) {
+      physicsGeometry = transitionOldGeometryShared.value;
+      physicsActivePlayerIds = transitionOldActivePlayerIdsShared.value;
+      ignoredWallSlot = transitionRemovedWallSlotShared.value;
+    }
+
     const result = updatePhysics(
       gameState.value,
       delta / 1000,
       localPlayerIdShared.value,
       playerPaddleOffset.value,
       CONFIG,
+      physicsGeometry,
+      physicsActivePlayerIds,
+      ignoredWallSlot,
     );
 
     if (
@@ -288,13 +485,12 @@ export default function GameScreen() {
       }
 
       /**
-       * Immediately clear the collision condition on the UI thread.
-       * Center-relaunch is deliberately chosen for shatter safety: the center
-       * is shared by every polygon size, so it is guaranteed to be inside the
-       * new arena once the React state snaps to N-1 sides.
+       * Preserve the Phase 3a center relaunch. The ball is now running from
+       * the shared center while the old boundary remains physical for the
+       * transition. The removed wall is already an open boundary.
        */
       const newBall = createBall(
-        CONFIG.geometry,
+        physicsGeometry,
         CONFIG.initialBallSpeed,
         randomLaunchAngle(),
       );
@@ -335,6 +531,8 @@ export default function GameScreen() {
               config={CONFIG}
               localSlot={localPlayerId}
               lives={lives}
+              transition={geometryTransition}
+              transitionProgress={transitionProgress}
             />
           </View>
         </GestureDetector>

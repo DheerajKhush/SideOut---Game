@@ -11,7 +11,14 @@ import {
 import { SharedValue, useDerivedValue } from "react-native-reanimated";
 
 import type { GameState, PhysicsConfig } from "@/game/engine/physics";
-import type { PolygonWall } from "@/game/engine/polygon";
+import type { PolygonGeometry, PolygonWall, Vec2 } from "@/game/engine/polygon";
+
+interface GeometryTransition {
+  oldGeometry: PolygonGeometry;
+  oldActivePlayerIds: number[];
+  /** Angle of the player's wall before the shatter. */
+  oldLocalWallAngle: number;
+}
 
 interface Props {
   state: SharedValue<GameState>;
@@ -21,6 +28,13 @@ interface Props {
   localSlot: number;
   /** Lives indexed by stable player id. */
   lives: number[];
+
+  /**
+   * Present while/after a shatter. The progress SharedValue drives the
+   * actual UI-thread interpolation from oldGeometry to config.geometry.
+   */
+  transition: GeometryTransition | null;
+  transitionProgress: SharedValue<number>;
 }
 
 const labelFont = matchFont({
@@ -29,12 +43,46 @@ const labelFont = matchFont({
   fontWeight: "700",
 });
 
+const lerp = (a: number, b: number, t: number) => {
+  "worklet";
+  return a + (b - a) * t;
+};
+
+const lerpVec = (a: Vec2, b: Vec2, t: number): Vec2 => {
+  "worklet";
+  return {
+    x: lerp(a.x, b.x, t),
+    y: lerp(a.y, b.y, t),
+  };
+};
+
+const normalizeVec = (v: Vec2): Vec2 => {
+  "worklet";
+  const length = Math.sqrt(v.x * v.x + v.y * v.y);
+  if (length < 0.000001) return { x: 0, y: 0 };
+  return { x: v.x / length, y: v.y / length };
+};
+
+const normalizeAngle = (angle: number) => {
+  "worklet";
+  let value = angle;
+  while (value > Math.PI) value -= Math.PI * 2;
+  while (value < -Math.PI) value += Math.PI * 2;
+  return value;
+};
+
+const lerpAngle = (a: number, b: number, t: number) => {
+  "worklet";
+  return a + normalizeAngle(b - a) * t;
+};
+
 /* =========================================================
  * WALL / PADDLE
  * ======================================================= */
 
 interface WallVisualProps {
   wall: PolygonWall;
+  oldWall: PolygonWall | null;
   state: SharedValue<GameState>;
   playerPaddleOffset: SharedValue<number>;
   paddleLength: number;
@@ -42,11 +90,12 @@ interface WallVisualProps {
   isLocal: boolean;
   label: string;
   lives: number;
-  localWallAngle: number;
+  transitionProgress: SharedValue<number>;
 }
 
 const WallVisual = ({
   wall,
+  oldWall,
   state,
   playerPaddleOffset,
   paddleLength,
@@ -54,73 +103,135 @@ const WallVisual = ({
   isLocal,
   label,
   lives,
-  localWallAngle,
+  transitionProgress,
 }: WallVisualProps) => {
   /**
-   * Always create this hook inside the child component. The parent can now
-   * change the number of walls without changing its hook count.
+   * The child owns these hooks so the parent can change the number of walls
+   * after a shatter without changing the parent's hook count.
+   *
+   * During a transition the wall's geometry is interpolated on the UI thread.
+   * For the first frame of the new logical geometry, oldWall still represents
+   * the exact pre-shatter wall belonging to this stable player id.
    */
-  const paddleOffset = useDerivedValue(() =>
-    isLocal
-      ? playerPaddleOffset.value
-      : (state.value.paddleOffsets[wall.slot] ?? 0),
-  );
+  const wallStart = useDerivedValue(() => {
+    const t = transitionProgress.value;
+    return lerpVec(oldWall?.start ?? wall.start, wall.start, t);
+  });
 
-  const paddleCenterX = useDerivedValue(
-    () => wall.center.x + wall.tangent.x * paddleOffset.value,
-  );
+  const wallEnd = useDerivedValue(() => {
+    const t = transitionProgress.value;
+    return lerpVec(oldWall?.end ?? wall.end, wall.end, t);
+  });
 
-  const paddleCenterY = useDerivedValue(
-    () => wall.center.y + wall.tangent.y * paddleOffset.value,
-  );
+  const wallCenter = useDerivedValue(() => {
+    const t = transitionProgress.value;
+    return lerpVec(oldWall?.center ?? wall.center, wall.center, t);
+  });
+
+  const wallTangent = useDerivedValue(() => {
+    const t = transitionProgress.value;
+    return normalizeVec(
+      lerpVec(oldWall?.tangent ?? wall.tangent, wall.tangent, t),
+    );
+  });
+
+  const wallOutward = useDerivedValue(() => {
+    const t = transitionProgress.value;
+    return normalizeVec(
+      lerpVec(oldWall?.outward ?? wall.outward, wall.outward, t),
+    );
+  });
+
+  const wallAngle = useDerivedValue(() => {
+    const t = transitionProgress.value;
+    return lerpAngle(oldWall?.angle ?? wall.angle, wall.angle, t);
+  });
+
+  /**
+   * Bot physics continues to own its old wall slot until the transition
+   * finishes. The completion callback maps those offsets onto the new slots.
+   * This keeps the paddle visually continuous instead of resetting it.
+   */
+  const paddleOffset = useDerivedValue(() => {
+    if (isLocal) return playerPaddleOffset.value;
+
+    const t = transitionProgress.value;
+    const oldOffset = oldWall
+      ? (state.value.paddleOffsets[oldWall.slot] ?? 0)
+      : (state.value.paddleOffsets[wall.slot] ?? 0);
+
+    const newOffset = state.value.paddleOffsets[wall.slot] ?? oldOffset;
+
+    return t < 0.999999 ? oldOffset : newOffset;
+  });
+
+  const paddleCenter = useDerivedValue(() => ({
+    x: wallCenter.value.x + wallTangent.value.x * paddleOffset.value,
+    y: wallCenter.value.y + wallTangent.value.y * paddleOffset.value,
+  }));
+
+  const paddleCenterX = useDerivedValue(() => paddleCenter.value.x);
+  const paddleCenterY = useDerivedValue(() => paddleCenter.value.y);
 
   const paddleStart = useDerivedValue(() => ({
-    x: paddleCenterX.value - wall.tangent.x * (paddleLength / 2),
-    y: paddleCenterY.value - wall.tangent.y * (paddleLength / 2),
+    x: paddleCenterX.value - wallTangent.value.x * (paddleLength / 2),
+    y: paddleCenterY.value - wallTangent.value.y * (paddleLength / 2),
   }));
 
   const paddleEnd = useDerivedValue(() => ({
-    x: paddleCenterX.value + wall.tangent.x * (paddleLength / 2),
-    y: paddleCenterY.value + wall.tangent.y * (paddleLength / 2),
+    x: paddleCenterX.value + wallTangent.value.x * (paddleLength / 2),
+    y: paddleCenterY.value + wallTangent.value.y * (paddleLength / 2),
   }));
 
-  const labelX = useDerivedValue(() => wall.center.x + wall.outward.x * 24);
-  const labelY = useDerivedValue(() => wall.center.y + wall.outward.y * 24);
+  const labelX = useDerivedValue(
+    () => wallCenter.value.x + wallOutward.value.x * 24,
+  );
+  const labelY = useDerivedValue(
+    () => wallCenter.value.y + wallOutward.value.y * 24,
+  );
+
+  // Skia's Group transform prop expects the transform array itself to be
+  // animated, rather than a DerivedValue nested inside the array.
+  const labelTransform = useDerivedValue(() => [
+    {
+      rotate: -(Math.PI / 2 - wallAngle.value),
+    },
+  ]);
+
+  const pipOneX = useDerivedValue(
+    () =>
+      wallCenter.value.x + wallOutward.value.x * 24 + wallTangent.value.x * 34,
+  );
+  const pipOneY = useDerivedValue(
+    () =>
+      wallCenter.value.y + wallOutward.value.y * 24 + wallTangent.value.y * 34,
+  );
+  const pipTwoX = useDerivedValue(
+    () =>
+      wallCenter.value.x + wallOutward.value.x * 24 + wallTangent.value.x * 42,
+  );
+  const pipTwoY = useDerivedValue(
+    () =>
+      wallCenter.value.y + wallOutward.value.y * 24 + wallTangent.value.y * 42,
+  );
 
   const primaryColor = isLocal ? "#67FFD1" : "#FF4D8D";
   const secondaryColor = isLocal ? "#18CFA5" : "#D92768";
   const wallColor = isLocal ? "#35FFD0" : "#32435C";
 
-  /**
-   * Pips are placed along the wall tangent so they remain beside the label
-   * after the entire polygon is rotated for the local player.
-   */
-  const pipOneX = useDerivedValue(
-    () => wall.center.x + wall.outward.x * 24 + wall.tangent.x * 34,
-  );
-  const pipOneY = useDerivedValue(
-    () => wall.center.y + wall.outward.y * 24 + wall.tangent.y * 34,
-  );
-  const pipTwoX = useDerivedValue(
-    () => wall.center.x + wall.outward.x * 24 + wall.tangent.x * 42,
-  );
-  const pipTwoY = useDerivedValue(
-    () => wall.center.y + wall.outward.y * 24 + wall.tangent.y * 42,
-  );
-
   return (
     <>
       <Line
-        p1={wall.start}
-        p2={wall.end}
+        p1={wallStart}
+        p2={wallEnd}
         color={wallColor}
         strokeWidth={5}
         opacity={isLocal ? 0.16 : 0.08}
       />
 
       <Line
-        p1={wall.start}
-        p2={wall.end}
+        p1={wallStart}
+        p2={wallEnd}
         color={wallColor}
         strokeWidth={1}
         opacity={isLocal ? 0.8 : 0.45}
@@ -174,14 +285,7 @@ const WallVisual = ({
         </>
       )}
 
-      <Group
-        origin={wall.center}
-        transform={[
-          {
-            rotate: -(Math.PI / 2 - localWallAngle),
-          },
-        ]}
-      >
+      <Group origin={wallCenter} transform={labelTransform}>
         <Text
           x={labelX}
           y={labelY}
@@ -220,10 +324,12 @@ export const GameRenderer = ({
   config,
   localSlot,
   lives,
+  transition,
+  transitionProgress,
 }: Props) => {
   const geometry = config.geometry;
 
-  /** localSlot is a stable player id; translate it to the current wall index. */
+  /** Stable player id -> current wall index. */
   let localWallIndex = 0;
 
   for (let i = 0; i < config.activePlayerIds.length; i++) {
@@ -234,7 +340,39 @@ export const GameRenderer = ({
   }
 
   const localWall = geometry.walls[localWallIndex];
-  const renderRotation = Math.PI / 2 - localWall.angle;
+
+  const oldLocalWall = transition
+    ? transition.oldGeometry.walls[
+        transition.oldActivePlayerIds.indexOf(localSlot)
+      ]
+    : null;
+
+  // Keep the whole transform array as a DerivedValue. Passing a
+  // DerivedValue<number> inside the transform array is rejected by the
+  // installed Skia TypeScript definitions.
+  const renderTransform = useDerivedValue(() => {
+    const currentAngle = localWall?.angle ?? 0;
+
+    if (!transition || !oldLocalWall) {
+      return [
+        {
+          rotate: Math.PI / 2 - currentAngle,
+        },
+      ];
+    }
+
+    const angle = lerpAngle(
+      transition.oldLocalWallAngle,
+      currentAngle,
+      transitionProgress.value,
+    );
+
+    return [
+      {
+        rotate: Math.PI / 2 - angle,
+      },
+    ];
+  });
 
   const ballX = useDerivedValue(() => state.value.ball.x);
   const ballY = useDerivedValue(() => state.value.ball.y);
@@ -323,13 +461,12 @@ export const GameRenderer = ({
         })}
       </Group>
 
-      <Group origin={geometry.center} transform={[{ rotate: renderRotation }]}>
+      <Group origin={geometry.center} transform={renderTransform}>
         {geometry.walls.map((wall) => {
           const playerId = config.activePlayerIds[wall.slot];
 
           // In the 2-player rectangle, slots 2 and 3 are passive side
-          // boundaries. They are fully reflecting in physics and are rendered
-          // as ordinary arena edges, not as player walls.
+          // boundaries. They are new terminal-state boundaries, not players.
           if (playerId == null) {
             return (
               <Line
@@ -345,10 +482,20 @@ export const GameRenderer = ({
 
           const isLocal = playerId === localSlot;
 
+          let oldWall: PolygonWall | null = null;
+
+          if (transition) {
+            const oldSlot = transition.oldActivePlayerIds.indexOf(playerId);
+            if (oldSlot >= 0) {
+              oldWall = transition.oldGeometry.walls[oldSlot] ?? null;
+            }
+          }
+
           return (
             <WallVisual
               key={`wall-${playerId}`}
               wall={wall}
+              oldWall={oldWall}
               state={state}
               playerPaddleOffset={playerPaddleOffset}
               paddleLength={config.paddleLength}
@@ -356,7 +503,7 @@ export const GameRenderer = ({
               isLocal={isLocal}
               label={isLocal ? "YOU" : `BOT ${playerId}`}
               lives={lives[playerId] ?? 0}
-              localWallAngle={localWall.angle}
+              transitionProgress={transitionProgress}
             />
           );
         })}

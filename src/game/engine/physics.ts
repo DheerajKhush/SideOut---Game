@@ -142,6 +142,7 @@ const findEarliestCollision = (
   dt: number,
   geometry: PolygonGeometry,
   radius: number,
+  ignoredWallSlot: number = -1,
 ): WallCollision | null => {
   "worklet";
 
@@ -154,6 +155,11 @@ const findEarliestCollision = (
   let earliest: WallCollision | null = null;
 
   for (let i = 0; i < geometry.walls.length; i++) {
+    // During a shatter transition the removed wall is physically gone.
+    // The renderer may still be animating the remaining walls, but the ball
+    // must be allowed to pass through the old removed edge.
+    if (i === ignoredWallSlot) continue;
+
     const wall = geometry.walls[i];
 
     const currentRelative = {
@@ -314,6 +320,9 @@ export const updatePhysics = (
   localPlayerId: number,
   localPaddleOffset: number,
   config: PhysicsConfig,
+  physicsGeometry: PolygonGeometry = config.geometry,
+  physicsActivePlayerIds: number[] = config.activePlayerIds,
+  ignoredWallSlot: number = -1,
 ): PhysicsResult => {
   "worklet";
 
@@ -322,11 +331,11 @@ export const updatePhysics = (
 
   const localWallIndex = findActiveWallIndex(
     localPlayerId,
-    config.activePlayerIds,
+    physicsActivePlayerIds,
   );
 
   if (localWallIndex >= 0) {
-    const localWall = config.geometry.walls[localWallIndex];
+    const localWall = physicsGeometry.walls[localWallIndex];
     const localMaxOffset = Math.max(
       0,
       localWall.length / 2 - config.paddleLength / 2,
@@ -341,12 +350,12 @@ export const updatePhysics = (
 
   // Only active player walls have paddles. In the 2-player rectangle,
   // walls 2 and 3 are passive side boundaries and must never get a bot paddle.
-  for (let i = 0; i < config.activePlayerIds.length; i++) {
+  for (let i = 0; i < physicsActivePlayerIds.length; i++) {
     if (i === localWallIndex) continue;
 
     paddleOffsets[i] = updateBotPaddle(
       paddleOffsets[i] ?? 0,
-      config.geometry.walls[i],
+      physicsGeometry.walls[i],
       state.ball,
       dt,
       config,
@@ -356,8 +365,9 @@ export const updatePhysics = (
   const collision = findEarliestCollision(
     state.ball,
     dt,
-    config.geometry,
+    physicsGeometry,
     config.ballRadius,
+    ignoredWallSlot,
   );
 
   if (collision === null) {
@@ -383,7 +393,7 @@ export const updatePhysics = (
    * In the 2-player rectangle, walls 2 and 3 are passive side boundaries.
    * They reflect the ball completely and never cost a life.
    */
-  if (wall.slot >= config.activePlayerIds.length) {
+  if (wall.slot >= physicsActivePlayerIds.length) {
     const reflected = reflectVelocity(
       state.ball.vx,
       state.ball.vy,
@@ -464,7 +474,7 @@ export const updatePhysics = (
         paddleOffsets,
       },
       missedWall: wall.slot,
-      missedPlayerId: config.activePlayerIds[wall.slot] ?? null,
+      missedPlayerId: physicsActivePlayerIds[wall.slot] ?? null,
     };
   }
 
@@ -480,7 +490,7 @@ export const updatePhysics = (
     state: {
       ball: bouncedBall,
       paddleOffsets,
-      lastHitter: config.activePlayerIds[wall.slot] ?? null,
+      lastHitter: physicsActivePlayerIds[wall.slot] ?? null,
     },
     missedWall: null,
     missedPlayerId: null,
