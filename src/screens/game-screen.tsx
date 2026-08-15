@@ -27,6 +27,9 @@ import {
   INITIAL_SPAWN_DELAY_MS,
   MAX_BALL_COUNT,
   MAX_BALL_SPEED,
+  MIN_ARENA_RADIUS,
+  SHRINK_RATE,
+  SHRINK_START_MS,
   SPAWN_INTERVAL_MS,
   updatePhysics,
   type PhysicsConfig,
@@ -59,6 +62,7 @@ const randomLaunchAngle = () => {
 interface GeometryTransition {
   oldGeometry: PolygonGeometry;
   oldActivePlayerIds: number[];
+
   /** Angle of the local player's wall immediately before the shatter. */
   oldLocalWallAngle: number;
 }
@@ -66,38 +70,56 @@ interface GeometryTransition {
 export default function GameScreen() {
   const { width, height } = useWindowDimensions();
 
-  /** Stable player ids. Wall indices are allowed to change after shatter. */
+  /**
+   * This is the ORIGINAL radius.
+   *
+   * Wall-count geometry is still generated from this radius.
+   *
+   * Continuous shrink is layered on top through arenaScaleShared.
+   */
+  const baseRadius = Math.min(width, height) * 0.5;
+
+  /** Stable player ids. */
   const [activePlayers, setActivePlayers] = useState<number[]>(createPlayerIds);
+
   const [localPlayerId, setLocalPlayerId] = useState(0);
+
   const [lives, setLives] = useState<number[]>(() =>
     new Array(PLAYER_COUNT).fill(INITIAL_LIVES),
   );
 
-  /** Renderer-side snapshot used to morph old walls into new walls. */
+  /**
+   * Renderer-side snapshot used ONLY for
+   * the Phase 3b wall-count morph.
+   */
   const [geometryTransition, setGeometryTransition] =
     useState<GeometryTransition | null>(null);
 
-  const radius = Math.min(width, height) * 0.42;
-
   /**
-   * Normal elimination uses the regular polygon: 8 -> 7 -> ... -> 3.
+   * =========================================================
+   * PHASE 3b — WALL COUNT GEOMETRY
+   * =========================================================
    *
-   * Two players are a terminal state and are NOT represented as a 2-gon.
-   * They become the top and bottom walls of an explicit rectangle.
+   * This geometry is always created at baseRadius.
+   *
+   * It changes because players are eliminated.
+   *
+   * It does NOT contain the continuous shrink state.
    */
   const geometry = useMemo(
     () =>
       activePlayers.length === 2
-        ? createTwoPlayerRectangleGeometry(radius, width / 2, height / 2)
+        ? createTwoPlayerRectangleGeometry(baseRadius, width / 2, height / 2)
         : activePlayers.length === 1
-          ? createWinnerGeometry(radius, width / 2, height / 2)
+          ? createWinnerGeometry(baseRadius, width / 2, height / 2)
           : createPolygonGeometry(
               activePlayers.length,
-              radius,
+              baseRadius,
               width / 2,
               height / 2,
             ),
-    [activePlayers.length, radius, width, height],
+
+    [activePlayers.length, baseRadius, width, height],
   );
 
   const CONFIG: PhysicsConfig = useMemo(
@@ -107,17 +129,24 @@ export default function GameScreen() {
 
       ballRadius: 8,
 
+      /**
+       * BASE paddle dimensions.
+       *
+       * updatePhysics scales paddleLength using
+       * the current arena scale every tick.
+       */
       paddleLength: 58,
       paddleThickness: 12,
 
       initialBallSpeed: 280,
-      maxBallSpeed: 650,
+      maxBallSpeed: MAX_BALL_SPEED,
 
       botMaxSpeed: 145,
       botReactionDeadZone: 12,
 
       maxBounceAngle: Math.PI / 3,
     }),
+
     [geometry, activePlayers],
   );
 
@@ -130,32 +159,75 @@ export default function GameScreen() {
   /** Stable player id used by the UI-thread physics loop. */
   const localPlayerIdShared = useSharedValue(0);
 
-  /** Shared transition state consumed by the UI-thread physics loop. */
+  /**
+   * =========================================================
+   * PHASE 3b — WALL COUNT TRANSITION STATE
+   * =========================================================
+   */
   const transitionActiveShared = useSharedValue(false);
+
   const transitionProgress = useSharedValue(1);
+
   const transitionOldGeometryShared = useSharedValue<PolygonGeometry | null>(
     null,
   );
+
   const transitionOldActivePlayerIdsShared = useSharedValue<number[]>([]);
+
   const transitionNewGeometryShared = useSharedValue<PolygonGeometry | null>(
     null,
   );
+
   const transitionNewActivePlayerIdsShared = useSharedValue<number[]>([]);
+
   const transitionRemovedWallSlotShared = useSharedValue(-1);
+
+  /**
+   * =========================================================
+   * PHASE 5 — CONTINUOUS RADIUS SHRINK
+   * =========================================================
+   *
+   * This mechanism NEVER changes activePlayers.
+   *
+   * It NEVER creates/removes walls.
+   *
+   * It only changes arenaScaleShared.
+   */
+  const shrinkElapsedMs = useSharedValue(0);
+
+  const arenaRadiusShared = useSharedValue(baseRadius);
+
+  const arenaScaleShared = useSharedValue(1);
 
   const gameOverShared = useSharedValue(false);
 
-  /** Round-time accumulator used for additional-ball spawning. */
+  /**
+   * Round-time accumulator used for additional-ball spawning.
+   */
   const spawnElapsedMs = useSharedValue(0);
+
   const nextSpawnAtMs = useSharedValue(INITIAL_SPAWN_DELAY_MS);
 
-  /** Blocks duplicate miss events while JS applies the elimination. */
+  /**
+   * Blocks duplicate miss events while JS applies elimination.
+   */
   const missPendingShared = useSharedValue(false);
 
   const addPoint = (playerId: number) => {
     useGameStore.getState().addPoint(playerId);
   };
 
+  /**
+   * =========================================================
+   * PHASE 3b — WALL COUNT TRANSITION
+   * =========================================================
+   *
+   * Notice that this function does NOT modify the shrink timer
+   * or shrink scale.
+   *
+   * Therefore a shatter during continuous shrink automatically
+   * inherits the current shrink scale.
+   */
   const startGeometryTransition = (
     oldGeometry: PolygonGeometry,
     oldActivePlayerIds: number[],
@@ -167,11 +239,17 @@ export default function GameScreen() {
     const removedWallSlot = oldActivePlayerIds.indexOf(removedPlayerId);
 
     transitionOldGeometryShared.value = oldGeometry;
+
     transitionOldActivePlayerIdsShared.value = [...oldActivePlayerIds];
+
     transitionNewGeometryShared.value = nextGeometry;
+
     transitionNewActivePlayerIdsShared.value = [...nextActivePlayerIds];
+
     transitionRemovedWallSlotShared.value = removedWallSlot;
+
     transitionActiveShared.value = true;
+
     transitionProgress.value = 0;
 
     setGeometryTransition({
@@ -182,23 +260,33 @@ export default function GameScreen() {
 
     transitionProgress.value = withTiming(
       1,
-      { duration: SHATTER_TRANSITION_MS },
+      {
+        duration: SHATTER_TRANSITION_MS,
+      },
       (finished) => {
-        if (!finished) return;
+        if (!finished) {
+          return;
+        }
 
         /**
-         * Physics has been using the old wall indices throughout the
-         * transition. Preserve each surviving player's paddle offset when
-         * switching the state array to the new wall indices.
+         * Physics has been using old wall indices throughout
+         * the transition.
+         *
+         * Preserve paddle offsets when changing wall indices.
          */
         const oldState = gameState.value;
+
         const oldIds = transitionOldActivePlayerIdsShared.value;
+
         const newIds = transitionNewActivePlayerIdsShared.value;
+
         const oldOffsets = oldState.paddleOffsets;
+
         const mappedOffsets = new Array(newIds.length).fill(0);
 
         for (let newIndex = 0; newIndex < newIds.length; newIndex++) {
           const playerId = newIds[newIndex];
+
           let oldIndex = -1;
 
           for (let i = 0; i < oldIds.length; i++) {
@@ -215,48 +303,64 @@ export default function GameScreen() {
 
         const newGeometry = transitionNewGeometryShared.value;
 
-        // The shattered wall is intentionally open during the transition, so
-        // the ball may have crossed that old edge. Before handing physics to
-        // the smaller arena, guarantee the ball is valid in the new geometry.
-        // Normal transitions keep the ball inside; this is only a safety
-        // recovery for the open-edge case.
+        /**
+         * The removed wall was open during the transition.
+         *
+         * If a ball escaped through it, recover it safely.
+         *
+         * IMPORTANT:
+         * The current arena scale remains untouched.
+         * The new geometry will be scaled by the current
+         * shrink value on the next physics tick.
+         */
         const handoffBalls = [...oldState.balls];
 
         for (let ballIndex = 0; ballIndex < handoffBalls.length; ballIndex++) {
           const ball = handoffBalls[ballIndex];
+
           let outsideNewGeometry = false;
 
           const wallCount = newGeometry ? newGeometry.walls.length : 0;
 
           for (let i = 0; i < wallCount; i++) {
             const wall = newGeometry!.walls[i];
+
             const relativeX = ball.x - wall.start.x;
+
             const relativeY = ball.y - wall.start.y;
+
             const distance =
               relativeX * wall.outward.x + relativeY * wall.outward.y;
 
             if (distance < -CONFIG.ballRadius) {
               outsideNewGeometry = true;
+
               break;
             }
           }
 
           if (outsideNewGeometry && newGeometry !== null) {
             const speed = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+
             const safeSpeed = Math.max(1, Math.min(speed, MAX_BALL_SPEED));
+
             const directionLength = Math.sqrt(
               ball.vx * ball.vx + ball.vy * ball.vy,
             );
 
             const directionX =
               directionLength > 0.0001 ? ball.vx / directionLength : 1;
+
             const directionY =
               directionLength > 0.0001 ? ball.vy / directionLength : 0;
 
             handoffBalls[ballIndex] = {
               x: newGeometry.center.x,
+
               y: newGeometry.center.y,
+
               vx: directionX * safeSpeed,
+
               vy: directionY * safeSpeed,
             };
           }
@@ -269,47 +373,66 @@ export default function GameScreen() {
         };
 
         transitionActiveShared.value = false;
+
         transitionRemovedWallSlotShared.value = -1;
+
         transitionOldGeometryShared.value = null;
+
         transitionOldActivePlayerIdsShared.value = [];
+
         transitionNewGeometryShared.value = null;
+
         transitionNewActivePlayerIdsShared.value = [];
 
-        // The next miss is allowed only after the current shatter transition
-        // has completely handed physics to the new geometry.
         missPendingShared.value = false;
       },
     );
   };
 
   /**
-   * Apply a miss on the JS thread.
-   *
-   * The existing Phase 3a lives/shatter/win decisions are intentionally kept
-   * unchanged. The only addition is that the old geometry is retained for a
-   * 500 ms visual/physics handoff before the new geometry becomes physical.
+   * =========================================================
+   * MISS / ELIMINATION
+   * =========================================================
    */
   const handleMiss = (playerId: number, missedBallIndex: number) => {
-    // A terminal state or an already queued miss must never fire twice.
     if (gameOverShared.value || !missPendingShared.value) {
       return;
     }
 
     if (!activePlayers.includes(playerId)) {
       missPendingShared.value = false;
+
       return;
     }
 
+    /**
+     * This is the CURRENT wall-count geometry at BASE radius.
+     *
+     * Continuous shrink is NOT stored here.
+     *
+     * Renderer + physics apply arenaScaleShared separately.
+     */
     const oldGeometry = CONFIG.geometry;
+
     const oldActivePlayerIds = [...activePlayers];
+
     const oldLocalPlayerId = localPlayerIdShared.value;
+
     const oldLocalWallIndex = oldActivePlayerIds.indexOf(oldLocalPlayerId);
+
     const oldLocalWallAngle = oldGeometry.walls[oldLocalWallIndex]?.angle ?? 0;
 
     const nextLives = [...lives];
+
     nextLives[playerId] = Math.max(0, nextLives[playerId] - 1);
+
     setLives(nextLives);
 
+    /**
+     * Player still has a life.
+     *
+     * This is NOT a wall-count resize.
+     */
     if (nextLives[playerId] > 0) {
       const balls = [...gameState.value.balls];
 
@@ -328,9 +451,17 @@ export default function GameScreen() {
       };
 
       missPendingShared.value = false;
+
       return;
     }
 
+    /**
+     * =======================================================
+     * PHASE 3b
+     * =======================================================
+     *
+     * This is the ONLY place where wall COUNT changes.
+     */
     const nextPlayers = activePlayers.filter((id) => id !== playerId);
 
     console.log(
@@ -341,31 +472,49 @@ export default function GameScreen() {
       console.log(
         "[GAME STATE] 2 walls remain — entering playable rectangle phase.",
       );
-      // IMPORTANT: this is NOT game over. The two remaining players continue
-      // playing between the top/bottom walls while left/right reflect.
     } else if (nextPlayers.length === 1) {
       console.log(
         `[GAME END] P${nextPlayers[0]} is the winner — 1 wall remains.`,
       );
+
       gameOverShared.value = true;
     }
 
     if (playerId === localPlayerIdShared.value && nextPlayers.length > 0) {
       const nextLocalPlayer = nextPlayers[0];
+
       localPlayerIdShared.value = nextLocalPlayer;
+
       setLocalPlayerId(nextLocalPlayer);
+
       playerPaddleOffset.value = 0;
+
       gestureStartOffset.value = 0;
     }
 
+    /**
+     * IMPORTANT:
+     *
+     * This geometry is generated using BASE radius.
+     *
+     * The current shrink scale is NOT reset.
+     *
+     * Example:
+     *
+     * base radius = 350
+     * current scale = 0.72
+     *
+     * old geometry and new geometry are both subsequently
+     * rendered/simulated at 72% of their radius.
+     */
     const nextGeometry =
       nextPlayers.length === 2
-        ? createTwoPlayerRectangleGeometry(radius, width / 2, height / 2)
+        ? createTwoPlayerRectangleGeometry(baseRadius, width / 2, height / 2)
         : nextPlayers.length === 1
-          ? createWinnerGeometry(radius, width / 2, height / 2)
+          ? createWinnerGeometry(baseRadius, width / 2, height / 2)
           : createPolygonGeometry(
               nextPlayers.length,
-              radius,
+              baseRadius,
               width / 2,
               height / 2,
             );
@@ -381,28 +530,31 @@ export default function GameScreen() {
 
     setActivePlayers(nextPlayers);
 
-    // Keep missPendingShared locked until the 500 ms transition finishes.
-    // This prevents a second shatter from starting while the first geometry
-    // handoff is still in flight. The 2-player rectangle remains playable
-    // immediately after that handoff.
+    /**
+     * Keep missPendingShared locked until the transition finishes.
+     */
   };
 
   /**
-   * Debug: switch the local player, but only among players that are still
-   * active. This keeps player identity separate from the current wall index.
+   * Debug: switch the local player.
    */
   const cycleLocalPlayer = () => {
-    if (activePlayers.length === 0) return;
+    if (activePlayers.length === 0) {
+      return;
+    }
 
     setLocalPlayerId((current) => {
       const currentIndex = activePlayers.indexOf(current);
+
       const next =
         activePlayers[
           (currentIndex + 1 + activePlayers.length) % activePlayers.length
         ];
 
       localPlayerIdShared.value = next;
+
       playerPaddleOffset.value = 0;
+
       gestureStartOffset.value = 0;
 
       return next;
@@ -417,28 +569,56 @@ export default function GameScreen() {
     })
     .onUpdate((event) => {
       let localWallIndex = -1;
+
       let activeIds = CONFIG.activePlayerIds;
+
       let geometryForInput = CONFIG.geometry;
 
+      /**
+       * During Phase 3b transition, input remains
+       * attached to the old wall.
+       */
       if (
         transitionActiveShared.value &&
         transitionOldGeometryShared.value !== null
       ) {
         activeIds = transitionOldActivePlayerIdsShared.value;
+
         geometryForInput = transitionOldGeometryShared.value;
       }
 
       for (let i = 0; i < activeIds.length; i++) {
         if (activeIds[i] === localPlayerIdShared.value) {
           localWallIndex = i;
+
           break;
         }
       }
 
-      if (localWallIndex < 0) return;
+      if (localWallIndex < 0) {
+        return;
+      }
 
       const wall = geometryForInput.walls[localWallIndex];
-      const maxOffset = Math.max(0, wall.length / 2 - CONFIG.paddleLength / 2);
+
+      /**
+       * IMPORTANT:
+       *
+       * Gesture coordinates are BASE geometry coordinates.
+       *
+       * Convert the current local movement limits using
+       * the CURRENT shrink scale.
+       */
+      const currentScale = arenaScaleShared.value;
+
+      const currentPaddleLength = CONFIG.paddleLength * currentScale;
+
+      const currentWallLength = wall.length * currentScale;
+
+      const maxOffset = Math.max(
+        0,
+        currentWallLength / 2 - currentPaddleLength / 2,
+      );
 
       const nextOffset = gestureStartOffset.value + event.translationX;
 
@@ -448,13 +628,59 @@ export default function GameScreen() {
       );
     });
 
+  /**
+   * =========================================================
+   * UI THREAD GAME LOOP
+   * =========================================================
+   */
   useFrameCallback((frameInfo) => {
-    if (gameOverShared.value) return;
+    if (gameOverShared.value) {
+      return;
+    }
 
     const delta = frameInfo.timeSincePreviousFrame;
 
-    if (delta == null) return;
+    if (delta == null) {
+      return;
+    }
 
+    /**
+     * =====================================================
+     * PHASE 5 — CONTINUOUS SHRINK
+     * =====================================================
+     *
+     * This runs independently of wall-count elimination.
+     *
+     * No geometry vertex count changes here.
+     */
+    shrinkElapsedMs.value += delta;
+
+    if (shrinkElapsedMs.value > SHRINK_START_MS) {
+      const elapsedAfterStart = shrinkElapsedMs.value - SHRINK_START_MS;
+
+      const shrinkDistance = (elapsedAfterStart / 1000) * SHRINK_RATE;
+
+      const currentRadius = Math.max(
+        MIN_ARENA_RADIUS,
+        baseRadius - shrinkDistance,
+      );
+
+      const currentScale = baseRadius > 0 ? currentRadius / baseRadius : 1;
+
+      arenaRadiusShared.value = currentRadius;
+
+      arenaScaleShared.value = currentScale;
+    } else {
+      arenaRadiusShared.value = baseRadius;
+
+      arenaScaleShared.value = 1;
+    }
+
+    /**
+     * =====================================================
+     * PHASE 4b — MULTI-BALL SPAWNING
+     * =====================================================
+     */
     spawnElapsedMs.value += delta;
 
     if (
@@ -475,6 +701,7 @@ export default function GameScreen() {
             randomLaunchAngle(),
           ),
         );
+
         nextSpawnAtMs.value += SPAWN_INTERVAL_MS;
       }
 
@@ -484,33 +711,66 @@ export default function GameScreen() {
       };
     }
 
+    /**
+     * =====================================================
+     * PHASE 3b PHYSICS TRANSITION
+     * =====================================================
+     *
+     * During wall-count morph:
+     *
+     * - use OLD wall-count geometry
+     * - ignore removed wall
+     * - apply CURRENT arenaScale inside updatePhysics
+     *
+     * This is what lets the two mechanisms compose.
+     */
     let physicsGeometry = CONFIG.geometry;
+
     let physicsActivePlayerIds = CONFIG.activePlayerIds;
+
     let ignoredWallSlot = -1;
 
-    /**
-     * During the visual morph, the smaller polygon is deliberately NOT used
-     * by physics. We continue simulating against the old polygon, except the
-     * wall that just shattered is skipped completely (open boundary).
-     */
     if (
       transitionActiveShared.value &&
       transitionOldGeometryShared.value !== null
     ) {
       physicsGeometry = transitionOldGeometryShared.value;
+
       physicsActivePlayerIds = transitionOldActivePlayerIdsShared.value;
+
       ignoredWallSlot = transitionRemovedWallSlotShared.value;
     }
 
+    /**
+     * CURRENT shrink scale is passed on EVERY physics tick.
+     *
+     * updatePhysics then:
+     *
+     * 1. scales wall geometry
+     * 2. scales paddle length
+     * 3. runs collision detection
+     * 4. runs bot movement
+     * 5. runs multi-ball
+     * 6. runs speed escalation
+     */
     const result = updatePhysics(
       gameState.value,
+
       delta / 1000,
+
       localPlayerIdShared.value,
+
       playerPaddleOffset.value,
+
       CONFIG,
+
       physicsGeometry,
+
       physicsActivePlayerIds,
+
       ignoredWallSlot,
+
+      arenaScaleShared.value,
     );
 
     if (
@@ -518,18 +778,22 @@ export default function GameScreen() {
       result.missedPlayerId !== null &&
       !missPendingShared.value
     ) {
-      // Lock immediately on the UI thread so multiple frames cannot queue
-      // the same elimination before the JS state update arrives.
+      /**
+       * Lock immediately on UI thread.
+       */
       missPendingShared.value = true;
+
       if (result.state.lastHitter !== null) {
         runOnJS(addPoint)(result.state.lastHitter);
       }
 
       /**
-       * Relaunch only the ball that missed. All other balls keep their
-       * current trajectory and continue using the same physics path.
+       * Relaunch ONLY the ball that missed.
+       *
+       * Other balls keep their trajectories.
        */
       const nextBalls = [...result.state.balls];
+
       const missedBallIndex = result.missedBallIndex ?? 0;
 
       if (nextBalls[missedBallIndex]) {
@@ -547,6 +811,7 @@ export default function GameScreen() {
       };
 
       runOnJS(handleMiss)(result.missedPlayerId, missedBallIndex);
+
       return;
     }
 
@@ -569,7 +834,12 @@ export default function GameScreen() {
         </Text>
 
         <GestureDetector gesture={panGesture}>
-          <View style={{ width, height }}>
+          <View
+            style={{
+              width,
+              height,
+            }}
+          >
             <GameRenderer
               state={gameState}
               playerPaddleOffset={playerPaddleOffset}
@@ -578,6 +848,7 @@ export default function GameScreen() {
               lives={lives}
               transition={geometryTransition}
               transitionProgress={transitionProgress}
+              arenaScale={arenaScaleShared}
             />
           </View>
         </GestureDetector>
@@ -619,7 +890,7 @@ const styles = StyleSheet.create({
     left: 16,
     zIndex: 100,
     color: "#63FF9A",
-    fontSize: 18,
     fontWeight: "800",
+    fontSize: 18,
   },
 });
