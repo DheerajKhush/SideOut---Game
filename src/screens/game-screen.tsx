@@ -17,7 +17,7 @@ import {
 import {
   runOnJS,
   useFrameCallback,
-  useSharedValue
+  useSharedValue,
 } from "react-native-reanimated";
 
 import {
@@ -27,13 +27,20 @@ import {
   type PhysicsConfig,
 } from "@/game/engine/physics";
 
-import { createPolygonGeometry } from "@/game/engine/polygon";
+import {
+  createPolygonGeometry,
+  createTwoPlayerRectangleGeometry,
+  createWinnerGeometry,
+} from "@/game/engine/polygon";
 
 import { useGameStore } from "@/store/game-store";
 
 import { GameRenderer } from "@/render/game-renderer";
 
 const PLAYER_COUNT = 8;
+const INITIAL_LIVES = 2;
+const createPlayerIds = () =>
+  Array.from({ length: PLAYER_COUNT }, (_, index) => index);
 
 const randomLaunchAngle = () => {
   "worklet";
@@ -44,22 +51,40 @@ const randomLaunchAngle = () => {
 export default function GameScreen() {
   const { width, height } = useWindowDimensions();
 
-  const [localSlot, setLocalSlot] = useState(0);
+  /** Stable player ids. Wall indices are allowed to change after shatter. */
+  const [activePlayers, setActivePlayers] = useState<number[]>(createPlayerIds);
+  const [localPlayerId, setLocalPlayerId] = useState(0);
+  const [lives, setLives] = useState<number[]>(() =>
+    new Array(PLAYER_COUNT).fill(INITIAL_LIVES),
+  );
 
-  /**
-   * Keep a reasonable margin around
-   * the polygon.
-   */
   const radius = Math.min(width, height) * 0.42;
 
+  /**
+   * Normal elimination uses the regular polygon: 8 -> 7 -> ... -> 3.
+   *
+   * Two players are a terminal state and are NOT represented as a 2-gon.
+   * They become the top and bottom walls of an explicit rectangle.
+   */
   const geometry = useMemo(
-    () => createPolygonGeometry(PLAYER_COUNT, radius, width / 2, height / 2),
-    [width, height, radius],
+    () =>
+      activePlayers.length === 2
+        ? createTwoPlayerRectangleGeometry(radius, width / 2, height / 2)
+        : activePlayers.length === 1
+          ? createWinnerGeometry(radius, width / 2, height / 2)
+          : createPolygonGeometry(
+              activePlayers.length,
+              radius,
+              width / 2,
+              height / 2,
+            ),
+    [activePlayers.length, radius, width, height],
   );
 
   const CONFIG: PhysicsConfig = useMemo(
     () => ({
       geometry,
+      activePlayerIds: activePlayers,
 
       ballRadius: 8,
 
@@ -69,118 +94,142 @@ export default function GameScreen() {
       initialBallSpeed: 280,
       maxBallSpeed: 650,
 
-      /**
-       * Deliberately slower than
-       * the ball.
-       */
       botMaxSpeed: 145,
-
       botReactionDeadZone: 12,
 
-      /**
-       * Noticeable off-center
-       * paddle influence.
-       */
       maxBounceAngle: Math.PI / 3,
     }),
-    [geometry],
+    [geometry, activePlayers],
   );
 
-  /**
-   * Player paddle position along
-   * the local wall.
-   *
-   * This is canonical wall-local
-   * distance, NOT screen X.
-   */
   const playerPaddleOffset = useSharedValue(0);
 
-  /**
-   * Physics state remains canonical.
-   */
   const gameState = useSharedValue(
     createInitialState(geometry, CONFIG.initialBallSpeed, randomLaunchAngle()),
   );
 
-  /**
-   * Keep local slot on UI thread too.
-   */
-  const localSlotShared = useSharedValue(0);
-  const renderRotation = useSharedValue(Math.PI / 2 - geometry.walls[0].angle);
-  /**
-   * ------------------------------------------
-   * SCORE
-   * ------------------------------------------
-   */
+  /** Stable player id used by the UI-thread physics loop. */
+  const localPlayerIdShared = useSharedValue(0);
 
-  const addPoint = (slot: number) => {
-    useGameStore.getState().addPoint(slot);
+  /** No resize animation in this phase. */
+  const gameOverShared = useSharedValue(false);
+
+  /** Blocks duplicate miss events while JS applies the elimination. */
+  const missPendingShared = useSharedValue(false);
+
+  const addPoint = (playerId: number) => {
+    useGameStore.getState().addPoint(playerId);
   };
 
   /**
-   * ------------------------------------------
-   * DEBUG: CHANGE LOCAL PLAYER
-   * ------------------------------------------
+   * Apply a miss on the JS thread.
+   *
+   * The physics worklet has already relaunched the ball at the old polygon's
+   * center, so there is never a frame where the ball is left outside the new
+   * polygon. The old and new polygons share the same center.
+   */
+  const handleMiss = (playerId: number) => {
+    // A terminal state or an already queued miss must never fire twice.
+    if (gameOverShared.value || !missPendingShared.value) {
+      return;
+    }
+
+    if (!activePlayers.includes(playerId)) {
+      missPendingShared.value = false;
+      return;
+    }
+
+    const nextLives = [...lives];
+    nextLives[playerId] = Math.max(0, nextLives[playerId] - 1);
+    setLives(nextLives);
+
+    if (nextLives[playerId] > 0) {
+      missPendingShared.value = false;
+      return;
+    }
+
+    const nextPlayers = activePlayers.filter((id) => id !== playerId);
+
+    console.log(
+      `[ELIMINATION] P${playerId} shattered. ${nextPlayers.length} walls remain.`,
+    );
+
+    if (nextPlayers.length === 2) {
+      console.log(
+        "[GAME STATE] 2 walls remain — entering playable rectangle phase.",
+      );
+      // IMPORTANT: this is NOT game over. The two remaining players continue
+      // playing between the top/bottom walls while left/right reflect.
+    } else if (nextPlayers.length === 1) {
+      console.log(
+        `[GAME END] P${nextPlayers[0]} is the winner — 1 wall remains.`,
+      );
+      gameOverShared.value = true;
+    }
+
+    if (playerId === localPlayerIdShared.value && nextPlayers.length > 0) {
+      const nextLocalPlayer = nextPlayers[0];
+      localPlayerIdShared.value = nextLocalPlayer;
+      setLocalPlayerId(nextLocalPlayer);
+      playerPaddleOffset.value = 0;
+      gestureStartOffset.value = 0;
+    }
+
+    /**
+     * Phase 3 intentionally chooses the simplest safe re-clamp strategy:
+     * restart the single in-flight ball at the polygon center.
+     *
+     * Every generated polygon has the same center, so the ball is guaranteed
+     * to be valid in the new arena without any edge projection logic.
+     */
+    if (nextPlayers.length > 1) {
+      const nextGeometry =
+        nextPlayers.length === 2
+          ? createTwoPlayerRectangleGeometry(radius, width / 2, height / 2)
+          : createPolygonGeometry(
+              nextPlayers.length,
+              radius,
+              width / 2,
+              height / 2,
+            );
+
+      gameState.value = createInitialState(
+        nextGeometry,
+        CONFIG.initialBallSpeed,
+        randomLaunchAngle(),
+      );
+    }
+
+    setActivePlayers(nextPlayers);
+
+    // Only the 1-player winner state locks the game. The 2-player rectangle
+    // remains fully playable, so misses must continue to be accepted.
+    if (nextPlayers.length > 1) {
+      missPendingShared.value = false;
+    }
+  };
+
+  /**
+   * Debug: switch the local player, but only among players that are still
+   * active. This keeps player identity separate from the current wall index.
    */
   const cycleLocalPlayer = () => {
-    setLocalSlot((current) => {
-      const next = (current + 1) % PLAYER_COUNT;
+    if (activePlayers.length === 0) return;
 
-      /*
-       * Physics/debug state.
-       */
-      localSlotShared.value = next;
+    setLocalPlayerId((current) => {
+      const currentIndex = activePlayers.indexOf(current);
+      const next =
+        activePlayers[
+          (currentIndex + 1 + activePlayers.length) % activePlayers.length
+        ];
 
-      /*
-       * New canonical rotation required
-       * to bring this wall to the bottom.
-       */
-      const targetRotation = Math.PI / 2 - geometry.walls[next].angle;
-
-      /*
-       * Find the shortest path from the
-       * current rotation to the target.
-       */
-      const currentRotation = renderRotation.value;
-
-      const delta = normalizeAngle(targetRotation - currentRotation);
-
-      /*
-       * Put the new local paddle at
-       * the center of its wall.
-       */
+      localPlayerIdShared.value = next;
       playerPaddleOffset.value = 0;
-
       gestureStartOffset.value = 0;
 
       return next;
     });
   };
-
-  const normalizeAngle = (angle: number) => {
-    "worklet";
-
-    while (angle > Math.PI) {
-      angle -= Math.PI * 2;
-    }
-
-    while (angle < -Math.PI) {
-      angle += Math.PI * 2;
-    }
-
-    return angle;
-  };
-
-  /**
-   * ------------------------------------------
-   * PLAYER GESTURE
-   * ------------------------------------------
-   *
-   * Because the renderer rotates the polygon
-   * so the local wall is horizontal at the
-   * bottom, screen X maps directly to the
-   * local wall tangent.
-   */
 
   const gestureStartOffset = useSharedValue(0);
 
@@ -189,9 +238,19 @@ export default function GameScreen() {
       gestureStartOffset.value = playerPaddleOffset.value;
     })
     .onUpdate((event) => {
-      const wall = geometry.walls[localSlotShared.value];
+      let localWallIndex = -1;
 
-      const maxOffset = wall.length / 2 - CONFIG.paddleLength / 2;
+      for (let i = 0; i < CONFIG.activePlayerIds.length; i++) {
+        if (CONFIG.activePlayerIds[i] === localPlayerIdShared.value) {
+          localWallIndex = i;
+          break;
+        }
+      }
+
+      if (localWallIndex < 0) return;
+
+      const wall = CONFIG.geometry.walls[localWallIndex];
+      const maxOffset = Math.max(0, wall.length / 2 - CONFIG.paddleLength / 2);
 
       const nextOffset = gestureStartOffset.value + event.translationX;
 
@@ -201,60 +260,52 @@ export default function GameScreen() {
       );
     });
 
-  /**
-   * ------------------------------------------
-   * PHYSICS
-   * ------------------------------------------
-   */
   useFrameCallback((frameInfo) => {
+    if (gameOverShared.value) return;
+
     const delta = frameInfo.timeSincePreviousFrame;
 
-    if (delta == null) {
-      return;
-    }
+    if (delta == null) return;
 
     const result = updatePhysics(
       gameState.value,
       delta / 1000,
-      localSlotShared.value,
+      localPlayerIdShared.value,
       playerPaddleOffset.value,
       CONFIG,
     );
 
-    /**
-     * Someone missed.
-     */
-    if (result.missedWall !== null) {
-      /**
-       * Award the point to the
-       * last successful hitter.
-       */
+    if (
+      result.missedWall !== null &&
+      result.missedPlayerId !== null &&
+      !missPendingShared.value
+    ) {
+      // Lock immediately on the UI thread so multiple frames cannot queue
+      // the same elimination before the JS state update arrives.
+      missPendingShared.value = true;
       if (result.state.lastHitter !== null) {
         runOnJS(addPoint)(result.state.lastHitter);
       }
 
       /**
-       * IMPORTANT:
-       *
-       * Randomness happens here on
-       * the UI thread.
-       *
-       * Physics itself remains pure.
+       * Immediately clear the collision condition on the UI thread.
+       * Center-relaunch is deliberately chosen for shatter safety: the center
+       * is shared by every polygon size, so it is guaranteed to be inside the
+       * new arena once the React state snaps to N-1 sides.
        */
       const newBall = createBall(
-        geometry,
+        CONFIG.geometry,
         CONFIG.initialBallSpeed,
         randomLaunchAngle(),
       );
 
       gameState.value = {
         ...result.state,
-
         ball: newBall,
-
         lastHitter: null,
       };
 
+      runOnJS(handleMiss)(result.missedPlayerId);
       return;
     }
 
@@ -266,30 +317,24 @@ export default function GameScreen() {
   return (
     <GestureHandlerRootView style={styles.root}>
       <View style={styles.container}>
-        {/* Debug control */}
         <Pressable style={styles.debugButton} onPress={cycleLocalPlayer}>
           <Text style={styles.debugButtonText}>
-            LOCAL: P{localSlot} · ROTATE
+            LOCAL: P{localPlayerId} · ROTATE
           </Text>
         </Pressable>
 
-        {/* Local score */}
         <Text style={styles.score}>
-          P{localSlot}: {scores[localSlot] ?? 0}
+          P{localPlayerId}: {scores[localPlayerId] ?? 0}
         </Text>
 
         <GestureDetector gesture={panGesture}>
-          <View
-            style={{
-              width,
-              height,
-            }}
-          >
+          <View style={{ width, height }}>
             <GameRenderer
               state={gameState}
               playerPaddleOffset={playerPaddleOffset}
               config={CONFIG}
-              localSlot={localSlot}
+              localSlot={localPlayerId}
+              lives={lives}
             />
           </View>
         </GestureDetector>
@@ -313,12 +358,9 @@ const styles = StyleSheet.create({
     top: 50,
     right: 16,
     zIndex: 100,
-
     paddingHorizontal: 12,
     paddingVertical: 8,
-
     borderRadius: 8,
-
     backgroundColor: "rgba(30,40,60,0.9)",
   },
 
@@ -333,193 +375,8 @@ const styles = StyleSheet.create({
     top: 52,
     left: 16,
     zIndex: 100,
-
     color: "#63FF9A",
     fontSize: 18,
     fontWeight: "800",
   },
 });
-// import { StyleSheet, Text, View } from "react-native";
-
-// import {
-//   Gesture,
-//   GestureDetector,
-//   GestureHandlerRootView,
-// } from "react-native-gesture-handler";
-
-// import {
-//   runOnJS,
-//   useFrameCallback,
-//   useSharedValue,
-// } from "react-native-reanimated";
-
-// import {
-//   createBall,
-//   createInitialState,
-//   updatePhysics,
-//   type PhysicsConfig,
-// } from "@/game/engine/physics";
-
-// import { GameRenderer } from "@/render/game-renderer";
-// import { useGameStore } from "@/store/game-store";
-
-// const CONFIG: PhysicsConfig = {
-//   arenaWidth: 360,
-//   arenaHeight: 640,
-
-//   paddleWidth: 90,
-//   paddleHeight: 14,
-//   paddleMargin: 28,
-
-//   ballRadius: 8,
-
-//   initialBallSpeed: 280,
-//   maxBallSpeed: 650,
-
-//   botMaxSpeed: 220,
-
-//   maxBounceAngle: Math.PI / 4,
-// };
-
-// const randomLaunchAngle = () => {
-//   "worklet";
-
-//   const angle = Math.random() * (Math.PI * 0.8) + Math.PI * 0.1;
-
-//   return Math.random() < 0.5 ? angle : angle + Math.PI;
-// };
-
-// export default function GameScreen() {
-//   const playerPaddleX = useSharedValue(CONFIG.arenaWidth / 2);
-
-//   const gameState = useSharedValue(
-//     createInitialState(CONFIG, randomLaunchAngle()),
-//   );
-
-//   const scorePoint = (player: "player" | "bot") => {
-//     useGameStore.getState().addPoint(player);
-//   };
-
-//   /**
-//    * Player paddle gesture.
-//    *
-//    * Instead of accumulating event.changeX,
-//    * directly position the paddle at the finger.
-//    */
-//   const panGesture = Gesture.Pan().onUpdate((event) => {
-//     const halfPaddle = CONFIG.paddleWidth / 2;
-
-//     const minX = halfPaddle;
-//     const maxX = CONFIG.arenaWidth - halfPaddle;
-
-//     // event.x is relative to the GestureDetector.
-//     const nextX = Math.max(minX, Math.min(maxX, event.x));
-
-//     playerPaddleX.value = nextX;
-//   });
-
-//   /**
-//    * Physics loop.
-//    *
-//    * This runs on the UI thread.
-//    */
-//   useFrameCallback((frameInfo) => {
-//     const deltaTime = frameInfo.timeSincePreviousFrame;
-
-//     if (deltaTime == null) {
-//       return;
-//     }
-
-//     const nextState = updatePhysics(
-//       gameState.value,
-//       deltaTime / 1000,
-//       playerPaddleX.value,
-//       0,
-//       CONFIG,
-//     );
-
-//     /**
-//      * A player or bot missed.
-//      */
-//     if (nextState.lastScoredBy !== null) {
-//       const launchAngle = randomLaunchAngle();
-
-//       const resetBall = createBall(
-//         CONFIG.arenaWidth,
-//         CONFIG.arenaHeight,
-//         CONFIG.initialBallSpeed,
-//         launchAngle,
-//       );
-
-//       // Update score on JS thread.
-//       runOnJS(scorePoint)(nextState.lastScoredBy);
-
-//       // Reset ball and clear scoring event.
-//       gameState.value = {
-//         ...nextState,
-//         ball: resetBall,
-//         lastScoredBy: null,
-//       };
-
-//       return;
-//     }
-
-//     gameState.value = nextState;
-//   });
-
-//   const playerScore = useGameStore((state) => state.playerScore);
-
-//   const botScore = useGameStore((state) => state.botScore);
-
-//   return (
-//     <GestureHandlerRootView style={styles.root}>
-//       <View style={styles.container}>
-//         <Text style={styles.score}>
-//           {botScore} : {playerScore}
-//         </Text>
-
-//         <GestureDetector gesture={panGesture}>
-//           {/*
-//             IMPORTANT:
-//             Give the gesture surface the exact
-//             dimensions of the arena.
-//           */}
-//           <View
-//             style={{
-//               width: CONFIG.arenaWidth,
-//               height: CONFIG.arenaHeight,
-//             }}
-//           >
-//             <GameRenderer
-//               state={gameState}
-//               playerPaddleX={playerPaddleX}
-//               config={CONFIG}
-//             />
-//           </View>
-//         </GestureDetector>
-//       </View>
-//     </GestureHandlerRootView>
-//   );
-// }
-
-// const styles = StyleSheet.create({
-//   root: {
-//     flex: 1,
-//   },
-
-//   container: {
-//     flex: 1,
-//     alignItems: "center",
-//     justifyContent: "center",
-//     backgroundColor: "#111",
-//   },
-
-//   score: {
-//     position: "absolute",
-//     top: 40,
-//     zIndex: 10,
-//     color: "white",
-//     fontSize: 28,
-//     fontWeight: "700",
-//   },
-// });
