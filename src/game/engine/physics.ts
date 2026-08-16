@@ -85,6 +85,9 @@ export interface PhysicsConfig {
 export interface PhysicsResult {
   state: GameState;
 
+  /** Number of successful paddle collisions during this physics step. */
+  paddleHitCount: number;
+
   /** Current wall index that was missed. */
   missedWall: number | null;
 
@@ -469,6 +472,7 @@ const updateSingleBall = (
   const nextBalls = [...state.balls];
 
   let currentLastHitter = state.lastHitter;
+  let paddleHitCount = 0;
 
   const localWallIndex = findActiveWallIndex(
     localPlayerId,
@@ -614,6 +618,7 @@ const updateSingleBall = (
           lastHitter: currentLastHitter,
         },
 
+        paddleHitCount,
         missedWall: wall.slot,
 
         missedPlayerId: physicsActivePlayerIds[wall.slot] ?? null,
@@ -629,6 +634,8 @@ const updateSingleBall = (
       collision.point,
       config,
     );
+
+    paddleHitCount++;
 
     /**
      * IMPORTANT:
@@ -658,6 +665,7 @@ const updateSingleBall = (
       lastHitter: currentLastHitter,
     },
 
+    paddleHitCount,
     missedWall: null,
     missedPlayerId: null,
     missedBallIndex: null,
@@ -708,6 +716,8 @@ export const updatePhysics = (
   let paddleOffsets = [...state.paddleOffsets];
 
   let nextBalls = [...state.balls];
+
+  let paddleHitCount = 0;
 
   /**
    * Update each bot once per physics tick.
@@ -817,6 +827,8 @@ export const updatePhysics = (
 
     paddleOffsets = result.state.paddleOffsets;
 
+    paddleHitCount += result.paddleHitCount;
+
     state = {
       ...state,
       lastHitter: result.state.lastHitter,
@@ -830,6 +842,7 @@ export const updatePhysics = (
           lastHitter: result.state.lastHitter,
         },
 
+        paddleHitCount,
         missedWall: result.missedWall,
 
         missedPlayerId: result.missedPlayerId,
@@ -845,6 +858,8 @@ export const updatePhysics = (
       paddleOffsets,
       lastHitter: state.lastHitter,
     },
+
+    paddleHitCount,
 
     missedWall: null,
     missedPlayerId: null,

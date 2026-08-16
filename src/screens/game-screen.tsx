@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import {
   Pressable,
@@ -15,25 +15,22 @@ import {
 } from "react-native-gesture-handler";
 
 import {
-  runOnJS,
-  useFrameCallback,
-  useSharedValue,
-  withTiming,
-} from "react-native-reanimated";
-
-import {
   createBall,
   createInitialState,
   INITIAL_SPAWN_DELAY_MS,
   MAX_BALL_COUNT,
   MAX_BALL_SPEED,
   MIN_ARENA_RADIUS,
-  SHRINK_RATE,
-  SHRINK_START_MS,
   SPAWN_INTERVAL_MS,
   updatePhysics,
   type PhysicsConfig,
 } from "@/game/engine/physics";
+import {
+  useFrameCallback,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
+import { runOnJS } from "react-native-worklets";
 
 import {
   createPolygonGeometry,
@@ -44,12 +41,27 @@ import {
 
 import { useGameStore } from "@/store/game-store";
 
+import {
+  BOT_DIFFICULTY_CONFIG,
+  DEFAULT_SETTINGS,
+  getSettings,
+  type GameSettings,
+} from "@/store/settings-store";
+
+import {
+  initSfx,
+  playBallMissSfx,
+  playPaddleHitSfx,
+  playRoundLossSfx,
+  playRoundWinSfx,
+  playWallShatterSfx,
+} from "@/audio/sfx";
+
 import { BACKGROUND_OUTER } from "@/constants/game-colors";
 import BackgroundGrid from "@/render/backgroundGrid";
 import { GameRenderer } from "@/render/game-renderer";
 
 const PLAYER_COUNT = 8;
-const INITIAL_LIVES = 2;
 const SHATTER_TRANSITION_MS = 500;
 
 const createPlayerIds = () =>
@@ -73,7 +85,58 @@ interface GeometryTransition {
 }
 
 export default function GameScreen() {
+  const [roundSettings, setRoundSettings] = useState<GameSettings | null>(null);
+
+  useEffect(() => {
+    // Initialize the shared SFX system once when the game screen mounts.
+    //
+    // initSfx() is internally idempotent, so navigating back to the game
+    // screen will not create another audio pool or settings subscription.
+    initSfx();
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const loadRoundSettings = async () => {
+      let settings = DEFAULT_SETTINGS;
+
+      try {
+        settings = await getSettings();
+      } catch (error) {
+        console.error("Failed to load round settings:", error);
+      }
+
+      if (mounted) {
+        setRoundSettings(settings);
+      }
+    };
+
+    loadRoundSettings();
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  if (roundSettings === null) {
+    return (
+      <View style={styles.loadingContainer}>
+        <Text style={styles.loadingText}>LOADING ROUND</Text>
+      </View>
+    );
+  }
+
+  return <GameRound roundSettings={roundSettings} />;
+}
+
+function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
   const { width, height } = useWindowDimensions();
+
+  const inputScheme = roundSettings.inputScheme;
+  const paddleSensitivity = roundSettings.paddleSensitivity;
+  const shrinkStartMs = roundSettings.shrinkStartMs;
+  const shrinkRate = roundSettings.shrinkRate;
 
   /**
    * Original radius.
@@ -83,12 +146,14 @@ export default function GameScreen() {
    */
   const baseRadius = Math.min(width, height) * 0.5;
 
-  const [activePlayers, setActivePlayers] = useState<number[]>(createPlayerIds);
+  const [activePlayers, setActivePlayers] = useState<number[]>(
+    createPlayerIds,
+  );
 
   const [localPlayerId, setLocalPlayerId] = useState(0);
 
   const [lives, setLives] = useState<number[]>(() =>
-    new Array(PLAYER_COUNT).fill(INITIAL_LIVES),
+    new Array(PLAYER_COUNT).fill(roundSettings.startingLives),
   );
 
   /**
@@ -118,30 +183,41 @@ export default function GameScreen() {
   );
 
   const CONFIG: PhysicsConfig = useMemo(
-    () => ({
-      geometry,
-      activePlayerIds: activePlayers,
+    () => {
+      const botConfig =
+        BOT_DIFFICULTY_CONFIG[roundSettings.botDifficulty];
 
-      ballRadius: 8,
+      return {
+        geometry,
+        activePlayerIds: activePlayers,
 
-      paddleLength: 58,
-      paddleThickness: 12,
+        ballRadius: 8,
 
-      initialBallSpeed: 280,
-      maxBallSpeed: MAX_BALL_SPEED,
+        paddleLength: 58,
+        paddleThickness: 12,
 
-      botMaxSpeed: 145,
-      botReactionDeadZone: 12,
+        initialBallSpeed: 280,
+        maxBallSpeed: MAX_BALL_SPEED,
 
-      maxBounceAngle: Math.PI / 3,
-    }),
-    [geometry, activePlayers],
+        botMaxSpeed: botConfig.botMaxSpeed,
+        botReactionDeadZone: botConfig.botReactionDeadZone,
+
+        maxBounceAngle: Math.PI / 3,
+      };
+    },
+    [geometry, activePlayers, roundSettings.botDifficulty],
   );
 
   const playerPaddleOffset = useSharedValue(0);
 
+  const fixedZoneGestureActive = useSharedValue(false);
+
   const gameState = useSharedValue(
-    createInitialState(geometry, CONFIG.initialBallSpeed, randomLaunchAngle()),
+    createInitialState(
+      geometry,
+      CONFIG.initialBallSpeed,
+      randomLaunchAngle(),
+    ),
   );
 
   const localPlayerIdShared = useSharedValue(0);
@@ -153,17 +229,17 @@ export default function GameScreen() {
 
   const transitionProgress = useSharedValue(1);
 
-  const transitionOldGeometryShared = useSharedValue<PolygonGeometry | null>(
-    null,
-  );
+  const transitionOldGeometryShared =
+    useSharedValue<PolygonGeometry | null>(null);
 
-  const transitionOldActivePlayerIdsShared = useSharedValue<number[]>([]);
+  const transitionOldActivePlayerIdsShared =
+    useSharedValue<number[]>([]);
 
-  const transitionNewGeometryShared = useSharedValue<PolygonGeometry | null>(
-    null,
-  );
+  const transitionNewGeometryShared =
+    useSharedValue<PolygonGeometry | null>(null);
 
-  const transitionNewActivePlayerIdsShared = useSharedValue<number[]>([]);
+  const transitionNewActivePlayerIdsShared =
+    useSharedValue<number[]>([]);
 
   const transitionRemovedWallSlotShared = useSharedValue(-1);
 
@@ -271,12 +347,18 @@ export default function GameScreen() {
          */
         const handoffBalls = [...oldState.balls];
 
-        for (let ballIndex = 0; ballIndex < handoffBalls.length; ballIndex++) {
+        for (
+          let ballIndex = 0;
+          ballIndex < handoffBalls.length;
+          ballIndex++
+        ) {
           const ball = handoffBalls[ballIndex];
 
           let outsideNewGeometry = false;
 
-          const wallCount = newGeometry ? newGeometry.walls.length : 0;
+          const wallCount = newGeometry
+            ? newGeometry.walls.length
+            : 0;
 
           for (let i = 0; i < wallCount; i++) {
             const wall = newGeometry!.walls[i];
@@ -286,7 +368,8 @@ export default function GameScreen() {
             const relativeY = ball.y - wall.start.y;
 
             const distance =
-              relativeX * wall.outward.x + relativeY * wall.outward.y;
+              relativeX * wall.outward.x +
+              relativeY * wall.outward.y;
 
             if (distance < -CONFIG.ballRadius) {
               outsideNewGeometry = true;
@@ -295,27 +378,33 @@ export default function GameScreen() {
           }
 
           if (outsideNewGeometry && newGeometry) {
-            const speed = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+            const speed = Math.sqrt(
+              ball.vx * ball.vx + ball.vy * ball.vy,
+            );
 
-            const safeSpeed = Math.max(1, Math.min(speed, MAX_BALL_SPEED));
+            const safeSpeed = Math.max(
+              1,
+              Math.min(speed, MAX_BALL_SPEED),
+            );
 
             const directionLength = Math.sqrt(
               ball.vx * ball.vx + ball.vy * ball.vy,
             );
 
             const directionX =
-              directionLength > 0.0001 ? ball.vx / directionLength : 1;
+              directionLength > 0.0001
+                ? ball.vx / directionLength
+                : 1;
 
             const directionY =
-              directionLength > 0.0001 ? ball.vy / directionLength : 0;
+              directionLength > 0.0001
+                ? ball.vy / directionLength
+                : 0;
 
             handoffBalls[ballIndex] = {
               x: newGeometry.center.x,
-
               y: newGeometry.center.y,
-
               vx: directionX * safeSpeed,
-
               vy: directionY * safeSpeed,
 
               /**
@@ -354,14 +443,22 @@ export default function GameScreen() {
    * MISS / ELIMINATION
    * =========================================================
    */
-  const handleMiss = (playerId: number, missedBallIndex: number) => {
+  const handleMiss = (
+    playerId: number,
+    missedBallIndex: number,
+  ) => {
     if (gameOverShared.value || !missPendingShared.value) {
       return;
     }
 
+    /**
+     * Every missed ball costs a life and produces the
+     * ball-miss SFX.
+     */
+    playBallMissSfx();
+
     if (!activePlayers.includes(playerId)) {
       missPendingShared.value = false;
-
       return;
     }
 
@@ -371,13 +468,18 @@ export default function GameScreen() {
 
     const oldLocalPlayerId = localPlayerIdShared.value;
 
-    const oldLocalWallIndex = oldActivePlayerIds.indexOf(oldLocalPlayerId);
+    const oldLocalWallIndex =
+      oldActivePlayerIds.indexOf(oldLocalPlayerId);
 
-    const oldLocalWallAngle = oldGeometry.walls[oldLocalWallIndex]?.angle ?? 0;
+    const oldLocalWallAngle =
+      oldGeometry.walls[oldLocalWallIndex]?.angle ?? 0;
 
     const nextLives = [...lives];
 
-    nextLives[playerId] = Math.max(0, nextLives[playerId] - 1);
+    nextLives[playerId] = Math.max(
+      0,
+      nextLives[playerId] - 1,
+    );
 
     setLives(nextLives);
 
@@ -411,10 +513,15 @@ export default function GameScreen() {
     }
 
     /**
-     * Phase 3b:
-     * wall count changes here.
+     * Player has lost all lives.
+     *
+     * The wall is now destroyed.
      */
-    const nextPlayers = activePlayers.filter((id) => id !== playerId);
+    playWallShatterSfx();
+
+    const nextPlayers = activePlayers.filter(
+      (id) => id !== playerId,
+    );
 
     console.log(
       `[ELIMINATION] P${playerId} shattered. ${nextPlayers.length} walls remain.`,
@@ -429,10 +536,25 @@ export default function GameScreen() {
         `[GAME END] P${nextPlayers[0]} is the winner — 1 wall remains.`,
       );
 
+      /**
+       * The game is now over.
+       *
+       * Compare against the local player before changing
+       * localPlayerIdShared below.
+       */
+      if (nextPlayers[0] === oldLocalPlayerId) {
+        playRoundWinSfx();
+      } else {
+        playRoundLossSfx();
+      }
+
       gameOverShared.value = true;
     }
 
-    if (playerId === localPlayerIdShared.value && nextPlayers.length > 0) {
+    if (
+      playerId === localPlayerIdShared.value &&
+      nextPlayers.length > 0
+    ) {
       const nextLocalPlayer = nextPlayers[0];
 
       localPlayerIdShared.value = nextLocalPlayer;
@@ -451,9 +573,17 @@ export default function GameScreen() {
      */
     const nextGeometry =
       nextPlayers.length === 2
-        ? createTwoPlayerRectangleGeometry(baseRadius, width / 2, height / 2)
+        ? createTwoPlayerRectangleGeometry(
+            baseRadius,
+            width / 2,
+            height / 2,
+          )
         : nextPlayers.length === 1
-          ? createWinnerGeometry(baseRadius, width / 2, height / 2)
+          ? createWinnerGeometry(
+              baseRadius,
+              width / 2,
+              height / 2,
+            )
           : createPolygonGeometry(
               nextPlayers.length,
               baseRadius,
@@ -483,7 +613,8 @@ export default function GameScreen() {
 
       const next =
         activePlayers[
-          (currentIndex + 1 + activePlayers.length) % activePlayers.length
+          (currentIndex + 1 + activePlayers.length) %
+            activePlayers.length
         ];
 
       localPlayerIdShared.value = next;
@@ -504,10 +635,18 @@ export default function GameScreen() {
    * =========================================================
    */
   const panGesture = Gesture.Pan()
-    .onBegin(() => {
+    .onBegin((event) => {
+      fixedZoneGestureActive.value =
+        inputScheme === "drag-anywhere" ||
+        event.absoluteY >= height * 0.58;
+
       gestureStartOffset.value = playerPaddleOffset.value;
     })
     .onUpdate((event) => {
+      if (!fixedZoneGestureActive.value) {
+        return;
+      }
+
       let localWallIndex = -1;
 
       let activeIds = CONFIG.activePlayerIds;
@@ -520,11 +659,14 @@ export default function GameScreen() {
       ) {
         activeIds = transitionOldActivePlayerIdsShared.value;
 
-        geometryForInput = transitionOldGeometryShared.value;
+        geometryForInput =
+          transitionOldGeometryShared.value;
       }
 
       for (let i = 0; i < activeIds.length; i++) {
-        if (activeIds[i] === localPlayerIdShared.value) {
+        if (
+          activeIds[i] === localPlayerIdShared.value
+        ) {
           localWallIndex = i;
           break;
         }
@@ -534,25 +676,34 @@ export default function GameScreen() {
         return;
       }
 
-      const wall = geometryForInput.walls[localWallIndex];
+      const wall =
+        geometryForInput.walls[localWallIndex];
 
       const currentScale = arenaScaleShared.value;
 
-      const currentPaddleLength = CONFIG.paddleLength * currentScale;
+      const currentPaddleLength =
+        CONFIG.paddleLength * currentScale;
 
-      const currentWallLength = wall.length * currentScale;
+      const currentWallLength =
+        wall.length * currentScale;
 
       const maxOffset = Math.max(
         0,
-        currentWallLength / 2 - currentPaddleLength / 2,
+        currentWallLength / 2 -
+          currentPaddleLength / 2,
       );
 
-      const nextOffset = gestureStartOffset.value + event.translationX;
+      const nextOffset =
+        gestureStartOffset.value +
+        event.translationX * paddleSensitivity;
 
       playerPaddleOffset.value = Math.max(
         -maxOffset,
         Math.min(maxOffset, nextOffset),
       );
+    })
+    .onFinalize(() => {
+      fixedZoneGestureActive.value = false;
     });
 
   /**
@@ -580,17 +731,22 @@ export default function GameScreen() {
      */
     shrinkElapsedMs.value += delta;
 
-    if (shrinkElapsedMs.value > SHRINK_START_MS) {
-      const elapsedAfterStart = shrinkElapsedMs.value - SHRINK_START_MS;
+    if (shrinkElapsedMs.value > shrinkStartMs) {
+      const elapsedAfterStart =
+        shrinkElapsedMs.value - shrinkStartMs;
 
-      const shrinkDistance = (elapsedAfterStart / 1000) * SHRINK_RATE;
+      const shrinkDistance =
+        (elapsedAfterStart / 1000) * shrinkRate;
 
       const currentRadius = Math.max(
         MIN_ARENA_RADIUS,
         baseRadius - shrinkDistance,
       );
 
-      const currentScale = baseRadius > 0 ? currentRadius / baseRadius : 1;
+      const currentScale =
+        baseRadius > 0
+          ? currentRadius / baseRadius
+          : 1;
 
       arenaRadiusShared.value = currentRadius;
 
@@ -643,7 +799,8 @@ export default function GameScreen() {
      */
     let physicsGeometry = CONFIG.geometry;
 
-    let physicsActivePlayerIds = CONFIG.activePlayerIds;
+    let physicsActivePlayerIds =
+      CONFIG.activePlayerIds;
 
     let ignoredWallSlot = -1;
 
@@ -651,12 +808,29 @@ export default function GameScreen() {
       transitionActiveShared.value &&
       transitionOldGeometryShared.value !== null
     ) {
-      physicsGeometry = transitionOldGeometryShared.value;
+      physicsGeometry =
+        transitionOldGeometryShared.value;
 
-      physicsActivePlayerIds = transitionOldActivePlayerIdsShared.value;
+      physicsActivePlayerIds =
+        transitionOldActivePlayerIdsShared.value;
 
-      ignoredWallSlot = transitionRemovedWallSlotShared.value;
+      ignoredWallSlot =
+        transitionRemovedWallSlotShared.value;
     }
+
+    /**
+     * IMPORTANT:
+     *
+     * Keep the previous ball state before updatePhysics().
+     *
+     * updatePhysics creates new Ball objects when a paddle
+     * collision happens, including the new lastHitBySlot.
+     *
+     * Comparing previous/current lastHitBySlot lets us detect
+     * multiple simultaneous paddle hits without modifying
+     * the physics engine or doing audio work inside a worklet.
+     */
+    // const previousBalls = gameState.value.balls;
 
     /**
      * Current arenaScale is passed EVERY tick.
@@ -681,6 +855,29 @@ export default function GameScreen() {
       arenaScaleShared.value,
     );
 
+    /**
+     * =====================================================
+     * SFX — PADDLE HITS
+     * =====================================================
+     *
+     * Count successful paddle collisions across ALL active
+     * balls during this frame.
+     *
+     * This is deliberately aggregated into one JS call.
+     * That avoids calling runOnJS once per collision when
+     * several balls hit paddles in the same frame.
+     */
+   
+    if (result.paddleHitCount > 0) {
+  runOnJS(playPaddleHitSfx)(
+    result.paddleHitCount,
+  );
+}
+    /**
+     * =====================================================
+     * MISS
+     * =====================================================
+     */
     if (
       result.missedWall !== null &&
       result.missedPlayerId !== null &&
@@ -689,7 +886,9 @@ export default function GameScreen() {
       missPendingShared.value = true;
 
       if (result.state.lastHitter !== null) {
-        runOnJS(addPoint)(result.state.lastHitter);
+        runOnJS(addPoint)(
+          result.state.lastHitter,
+        );
       }
 
       /**
@@ -697,16 +896,20 @@ export default function GameScreen() {
        *
        * createBall() resets its trail to neutral.
        */
-      const nextBalls = [...result.state.balls];
+      const nextBalls = [
+        ...result.state.balls,
+      ];
 
-      const missedBallIndex = result.missedBallIndex ?? 0;
+      const missedBallIndex =
+        result.missedBallIndex ?? 0;
 
       if (nextBalls[missedBallIndex]) {
-        nextBalls[missedBallIndex] = createBall(
-          physicsGeometry,
-          CONFIG.initialBallSpeed,
-          randomLaunchAngle(),
-        );
+        nextBalls[missedBallIndex] =
+          createBall(
+            physicsGeometry,
+            CONFIG.initialBallSpeed,
+            randomLaunchAngle(),
+          );
       }
 
       gameState.value = {
@@ -715,7 +918,10 @@ export default function GameScreen() {
         lastHitter: null,
       };
 
-      runOnJS(handleMiss)(result.missedPlayerId, missedBallIndex);
+      runOnJS(handleMiss)(
+        result.missedPlayerId,
+        missedBallIndex,
+      );
 
       return;
     }
@@ -723,34 +929,51 @@ export default function GameScreen() {
     gameState.value = result.state;
   });
 
-  const scores = useGameStore((state) => state.scores);
+  const scores = useGameStore(
+    (state) => state.scores,
+  );
 
   return (
     <GestureHandlerRootView style={styles.root}>
       <View style={styles.container}>
-        <Pressable style={styles.debugButton} onPress={cycleLocalPlayer}>
+        <Pressable
+          style={styles.debugButton}
+          onPress={cycleLocalPlayer}
+        >
           <Text style={styles.debugButtonText}>
             LOCAL: P{localPlayerId} · ROTATE
           </Text>
         </Pressable>
 
         <Text style={styles.score}>
-          P{localPlayerId}: {scores[localPlayerId] ?? 0}
+          P{localPlayerId}:{" "}
+          {scores[localPlayerId] ?? 0}
         </Text>
 
         <GestureDetector gesture={panGesture}>
           <View style={{ height, width }}>
-            <BackgroundGrid width={width} height={height} />
+            <BackgroundGrid
+              width={width}
+              height={height}
+            />
 
             <GameRenderer
               state={gameState}
-              playerPaddleOffset={playerPaddleOffset}
+              playerPaddleOffset={
+                playerPaddleOffset
+              }
               config={CONFIG}
               localSlot={localPlayerId}
               lives={lives}
-              transition={geometryTransition}
-              transitionProgress={transitionProgress}
-              arenaScale={arenaScaleShared}
+              transition={
+                geometryTransition
+              }
+              transitionProgress={
+                transitionProgress
+              }
+              arenaScale={
+                arenaScaleShared
+              }
             />
           </View>
         </GestureDetector>
@@ -760,9 +983,23 @@ export default function GameScreen() {
 }
 
 const styles = StyleSheet.create({
+  loadingContainer: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: BACKGROUND_OUTER,
+  },
+
+  loadingText: {
+    color: "#8CC8FF",
+    fontSize: 11,
+    fontWeight: "800",
+    letterSpacing: 2,
+  },
+
   root: {
     flex: 1,
-    backgroundColor: BACKGROUND_OUTER
+    backgroundColor: BACKGROUND_OUTER,
   },
 
   container: {
