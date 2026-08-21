@@ -14,6 +14,7 @@ import {
 } from "@/game/engine/physics";
 
 import type { PolygonGeometry, PolygonWall, Vec2 } from "@/game/engine/polygon";
+import { useMemo } from "react";
 
 /**
  * Single persistent player color system.
@@ -524,6 +525,109 @@ const BallVisual = ({ state, ballIndex, ballRadius }: BallVisualProps) => {
   );
 };
 
+interface ShatterBurstProps {
+  center: Vec2;
+  color: string;
+  progress: SharedValue<number>;
+  arenaScale: SharedValue<number>;
+}
+
+const ShatterBurst = ({
+  center,
+  color,
+  progress,
+  arenaScale,
+}: ShatterBurstProps) => {
+  const PARTICLE_COUNT = 20;
+
+  return (
+    <Group>
+      {/* Central bloom */}
+      <Circle
+        cx={useDerivedValue(() => center.x)}
+        cy={useDerivedValue(() => center.y)}
+        r={useDerivedValue(() => {
+          const t = progress.value;
+          return 3 + t * 18;
+        })}
+        color={color}
+        opacity={useDerivedValue(() => {
+          const t = progress.value;
+
+          if (t >= 1) {
+            return 0;
+          }
+
+          return 0.22 * (1 - t) * (1 - t);
+        })}
+      />
+
+      {Array.from({ length: PARTICLE_COUNT }).map((_, index) => {
+        const angle =
+          (Math.PI * 2 * index) / PARTICLE_COUNT;
+
+        // Deterministic variation so every spark isn't identical.
+        const distance =
+          60 + (index % 3) * 15;
+
+        const x = useDerivedValue(() => {
+          const t = progress.value;
+
+          return (
+            center.x +
+            Math.cos(angle) *
+            distance *
+            t *
+            arenaScale.value
+          );
+        });
+
+        const y = useDerivedValue(() => {
+          const t = progress.value;
+
+          return (
+            center.y +
+            Math.sin(angle) *
+            distance *
+            t *
+            arenaScale.value
+          );
+        });
+
+        const opacity = useDerivedValue(() => {
+          const t = progress.value;
+
+          if (t >= 1) {
+            return 0;
+          }
+
+          // Fast quadratic fade.
+          const fade = 1 - t;
+
+          return 0.9 * fade * fade;
+        });
+
+        const radius = useDerivedValue(() => {
+          const t = progress.value;
+
+          return 2.4 - t * 1.4;
+        });
+
+        return (
+          <Circle
+            key={`shatter-spark-${index}`}
+            cx={x}
+            cy={y}
+            r={radius}
+            color={color}
+            opacity={opacity}
+          />
+        );
+      })}
+    </Group>
+  );
+};
+
 /* =========================================================
  * MAIN RENDERER
  * ======================================================= */
@@ -559,6 +663,25 @@ export const GameRenderer = ({
     transition.oldActivePlayerIds.indexOf(localSlot)
     ]
     : null;
+
+  const shatteredWall = useMemo(() => {
+    if (!transition) {
+      return null;
+    }
+
+    for (let i = 0; i < transition.oldActivePlayerIds.length; i++) {
+      const playerId = transition.oldActivePlayerIds[i];
+
+      if (!config.activePlayerIds.includes(playerId)) {
+        return {
+          wall: transition.oldGeometry.walls[i] ?? null,
+          playerId,
+        };
+      }
+    }
+
+    return null;
+  }, [transition, config.activePlayerIds]);
 
   const arenaTransform = useDerivedValue(() => {
     const progress = wallShatterProgress?.value ?? 1;
@@ -650,6 +773,16 @@ export const GameRenderer = ({
     >
       <Group origin={geometry.center}
         transform={arenaTransform}>
+
+        {shatteredWall?.wall && (
+          <ShatterBurst
+            center={shatteredWall.wall.center}
+            color={getPlayerSlotColor(shatteredWall.playerId)}
+            progress={wallShatterProgress!}
+            arenaScale={arenaScale}
+          />
+        )}
+
         {geometry.walls.map((wall) => {
           const playerId = config.activePlayerIds[wall.slot];
 
