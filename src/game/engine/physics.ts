@@ -96,6 +96,12 @@ export interface PhysicsResult {
 
   /** Index of the ball that caused the miss. */
   missedBallIndex: number | null;
+
+  /** Wall slots whose paddles were hit during this physics step. */
+  paddleHitWallSlots: number[];
+
+  /** Wall slot that was shattered during this physics step. */
+  wallShatteredSlot: number | null;
 }
 
 const clamp = (value: number, min: number, max: number): number => {
@@ -473,6 +479,7 @@ const updateSingleBall = (
 
   let currentLastHitter = state.lastHitter;
   let paddleHitCount = 0;
+  const paddleHitWallSlots: number[] = [];
 
   const localWallIndex = findActiveWallIndex(
     localPlayerId,
@@ -620,10 +627,12 @@ const updateSingleBall = (
 
         paddleHitCount,
         missedWall: wall.slot,
+        paddleHitWallSlots,
 
         missedPlayerId: physicsActivePlayerIds[wall.slot] ?? null,
 
         missedBallIndex: ballIndex,
+        wallShatteredSlot: null,
       };
     }
 
@@ -636,6 +645,7 @@ const updateSingleBall = (
     );
 
     paddleHitCount++;
+    paddleHitWallSlots.push(wall.slot);
 
     /**
      * IMPORTANT:
@@ -666,9 +676,11 @@ const updateSingleBall = (
     },
 
     paddleHitCount,
+    paddleHitWallSlots,
     missedWall: null,
     missedPlayerId: null,
     missedBallIndex: null,
+    wallShatteredSlot: null,
   };
 };
 
@@ -718,6 +730,7 @@ export const updatePhysics = (
   let nextBalls = [...state.balls];
 
   let paddleHitCount = 0;
+  const paddleHitWallSlots: number[] = [];
 
   /**
    * Update each bot once per physics tick.
@@ -828,6 +841,7 @@ export const updatePhysics = (
     paddleOffsets = result.state.paddleOffsets;
 
     paddleHitCount += result.paddleHitCount;
+    paddleHitWallSlots.push(...result.paddleHitWallSlots);
 
     state = {
       ...state,
@@ -843,11 +857,14 @@ export const updatePhysics = (
         },
 
         paddleHitCount,
+        paddleHitWallSlots,
         missedWall: result.missedWall,
 
         missedPlayerId: result.missedPlayerId,
 
         missedBallIndex: result.missedBallIndex,
+
+        wallShatteredSlot: result.wallShatteredSlot,
       };
     }
   }
@@ -860,10 +877,13 @@ export const updatePhysics = (
     },
 
     paddleHitCount,
+    paddleHitWallSlots,
 
     missedWall: null,
     missedPlayerId: null,
     missedBallIndex: null,
+
+    wallShatteredSlot: null,
   };
 };
 

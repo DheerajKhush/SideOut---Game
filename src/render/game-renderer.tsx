@@ -2,9 +2,7 @@ import {
   Canvas,
   Circle,
   Group,
-  Line,
-  Text,
-  matchFont
+  Line
 } from "@shopify/react-native-skia";
 
 import { SharedValue, useDerivedValue } from "react-native-reanimated";
@@ -69,13 +67,16 @@ interface Props {
   transitionProgress: SharedValue<number>;
 
   arenaScale: SharedValue<number>;
+  paddleFlashWallSlot?: SharedValue<number>;
+  paddleFlashProgress?: SharedValue<number>;
+  wallShatterProgress?: SharedValue<number>;
 }
 
-const labelFont = matchFont({
-  fontFamily: "sans-serif",
-  fontSize: 10,
-  fontWeight: "700",
-});
+// const labelFont = matchFont({
+//   fontFamily: "sans-serif",
+//   fontSize: 10,
+//   fontWeight: "700",
+// });
 
 const lerp = (a: number, b: number, t: number) => {
   "worklet";
@@ -201,6 +202,8 @@ interface WallVisualProps {
   arenaScale: SharedValue<number>;
 
   arenaCenter: Vec2;
+  paddleFlashWallSlot?: SharedValue<number>;
+  paddleFlashProgress?: SharedValue<number>;
 }
 
 const WallVisual = ({
@@ -217,6 +220,8 @@ const WallVisual = ({
   transitionProgress,
   arenaScale,
   arenaCenter,
+  paddleFlashWallSlot,
+  paddleFlashProgress,
 }: WallVisualProps) => {
   /**
    * Phase 3b:
@@ -321,13 +326,17 @@ const WallVisual = ({
     };
   });
 
-  const labelX = useDerivedValue(
-    () => wallCenter.value.x + wallOutward.value.x * (24 * arenaScale.value),
-  );
+  const paddleFlash = useDerivedValue(() => {
+    if (
+      !paddleFlashWallSlot ||
+      !paddleFlashProgress ||
+      paddleFlashWallSlot.value !== wall.slot
+    ) {
+      return 0;
+    }
 
-  const labelY = useDerivedValue(
-    () => wallCenter.value.y + wallOutward.value.y * (24 * arenaScale.value),
-  );
+    return paddleFlashProgress.value;
+  });
 
   const labelTransform = useDerivedValue(() => [
     {
@@ -335,33 +344,6 @@ const WallVisual = ({
     },
   ]);
 
-  const pipOneX = useDerivedValue(
-    () =>
-      wallCenter.value.x +
-      wallOutward.value.x * (24 * arenaScale.value) +
-      wallTangent.value.x * (34 * arenaScale.value),
-  );
-
-  const pipOneY = useDerivedValue(
-    () =>
-      wallCenter.value.y +
-      wallOutward.value.y * (24 * arenaScale.value) +
-      wallTangent.value.y * (34 * arenaScale.value),
-  );
-
-  const pipTwoX = useDerivedValue(
-    () =>
-      wallCenter.value.x +
-      wallOutward.value.x * (24 * arenaScale.value) +
-      wallTangent.value.x * (42 * arenaScale.value),
-  );
-
-  const pipTwoY = useDerivedValue(
-    () =>
-      wallCenter.value.y +
-      wallOutward.value.y * (24 * arenaScale.value) +
-      wallTangent.value.y * (42 * arenaScale.value),
-  );
 
   /**
    * SAME persistent color system used by ball trails.
@@ -407,6 +389,16 @@ const WallVisual = ({
         opacity={0.09}
         strokeCap="round"
       />
+      {/* Short contact glow — same color as the paddle */}
+      <Line
+        p1={paddleStart}
+        p2={paddleEnd}
+        color={primaryColor}
+        strokeWidth={paddleThickness + 16}
+        opacity={0}
+        strokeCap="round"
+      />
+
 
       <Line
         p1={paddleStart}
@@ -416,40 +408,6 @@ const WallVisual = ({
         strokeCap="round"
       />
 
-      <Line
-        p1={paddleStart}
-        p2={paddleEnd}
-        color="#FFFFFF"
-        strokeWidth={3}
-        opacity={0.9}
-        strokeCap="round"
-      />
-
-      <Group origin={wallCenter} transform={labelTransform}>
-        <Text
-          x={labelX}
-          y={labelY}
-          text={label}
-          font={labelFont}
-          color={primaryColor}
-        />
-
-        <Circle
-          cx={pipOneX}
-          cy={pipOneY}
-          r={2.5}
-          color="#A8B8CA"
-          opacity={lives >= 1 ? 0.95 : 0.15}
-        />
-
-        <Circle
-          cx={pipTwoX}
-          cy={pipTwoY}
-          r={2.5}
-          color="#A8B8CA"
-          opacity={lives >= 2 ? 0.95 : 0.15}
-        />
-      </Group>
     </>
   );
 };
@@ -579,6 +537,9 @@ export const GameRenderer = ({
   transition,
   transitionProgress,
   arenaScale,
+  paddleFlashWallSlot,
+  paddleFlashProgress,
+  wallShatterProgress
 }: Props) => {
   const geometry = config.geometry;
 
@@ -595,33 +556,79 @@ export const GameRenderer = ({
 
   const oldLocalWall = transition
     ? transition.oldGeometry.walls[
-        transition.oldActivePlayerIds.indexOf(localSlot)
-      ]
+    transition.oldActivePlayerIds.indexOf(localSlot)
+    ]
     : null;
 
-  const renderTransform = useDerivedValue(() => {
+  const arenaTransform = useDerivedValue(() => {
+    const progress = wallShatterProgress?.value ?? 1;
+
     const currentAngle = localWall?.angle ?? 0;
 
-    if (!transition || !oldLocalWall) {
-      return [
-        {
-          rotate: Math.PI / 2 - currentAngle,
-        },
-      ];
+    let angle = currentAngle;
+
+    if (transition && oldLocalWall) {
+      angle = lerpAngle(
+        transition.oldLocalWallAngle,
+        currentAngle,
+        transitionProgress.value,
+      );
     }
 
-    const angle = lerpAngle(
-      transition.oldLocalWallAngle,
-      currentAngle,
-      transitionProgress.value,
-    );
+    // Wall-shatter impact:
+    // strong enough to notice, but decays very quickly.
+    let shakeX = 0;
+    let shakeY = 0;
+
+    if (progress < 1) {
+      const envelope = 1 - progress;
+
+      // 3 quick oscillations over 120ms.
+      const phase = progress * Math.PI * 6;
+
+      shakeX = Math.sin(phase) * 20 * envelope;
+      shakeY = Math.cos(phase * 0.9) * 5 * envelope;
+    }
 
     return [
       {
         rotate: Math.PI / 2 - angle,
       },
+      {
+        translateX: shakeX,
+      },
+      {
+        translateY: shakeY,
+      },
     ];
   });
+  // const renderTransform = useDerivedValue(() => {
+  //   const currentAngle = localWall?.angle ?? 0;
+
+  //   if (!transition || !oldLocalWall) {
+  //     return [
+  //       {
+  //         rotate: Math.PI / 2 - currentAngle,
+  //       },
+  //     ];
+  //   }
+
+  //   const angle = lerpAngle(
+  //     transition.oldLocalWallAngle,
+  //     currentAngle,
+  //     transitionProgress.value,
+  //   );
+
+  //   return [
+  //     {
+  //       rotate: Math.PI / 2 - angle,
+  //     }, {
+  //       translateX: shatterOffset.value.x,
+  //     }, {
+  //       translateY: shatterOffset.value.y,
+  //     }
+  //   ];
+  // }, [shatterOffset]);
 
   const canvasWidth = geometry.center.x * 2;
 
@@ -633,6 +640,7 @@ export const GameRenderer = ({
 
   const centerInnerRadius = useDerivedValue(() => 7 * arenaScale.value);
 
+
   return (
     <Canvas
       style={{
@@ -640,7 +648,8 @@ export const GameRenderer = ({
         height: canvasHeight,
       }}
     >
-      <Group origin={geometry.center} transform={renderTransform}>
+      <Group origin={geometry.center}
+        transform={arenaTransform}>
         {geometry.walls.map((wall) => {
           const playerId = config.activePlayerIds[wall.slot];
 
@@ -683,6 +692,8 @@ export const GameRenderer = ({
               transitionProgress={transitionProgress}
               arenaScale={arenaScale}
               arenaCenter={geometry.center}
+              paddleFlashWallSlot={paddleFlashWallSlot}
+              paddleFlashProgress={paddleFlashProgress}
             />
           );
         })}

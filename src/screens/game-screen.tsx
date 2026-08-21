@@ -26,6 +26,8 @@ import {
   type PhysicsConfig,
 } from "@/game/engine/physics";
 import {
+  cancelAnimation,
+  Easing,
   useFrameCallback,
   useSharedValue,
   withTiming,
@@ -83,6 +85,52 @@ interface GeometryTransition {
   oldActivePlayerIds: number[];
   oldLocalWallAngle: number;
 }
+
+const formatRoundTime = (elapsedMs: number) => {
+  const totalSeconds = Math.floor(elapsedMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(
+    2,
+    "0",
+  )}`;
+};
+
+const LifeGroup = ({
+  label,
+  lives,
+  color,
+}: {
+  label: string;
+  lives: number;
+  color: string;
+}) => {
+  const pipCount = Math.max(0, Math.min(2, lives));
+
+  return (
+    <View style={styles.lifeGroup}>
+      <Text style={[styles.lifeLabel, { color }]}>{label}</Text>
+
+      <View style={styles.lifePips}>
+        {[0, 1].map((index) => (
+          <Text
+            key={index}
+            style={[
+              styles.lifePip,
+              {
+                color,
+                opacity: index < pipCount ? 1 : 0.18,
+              },
+            ]}
+          >
+            ♥
+          </Text>
+        ))}
+      </View>
+    </View>
+  );
+};
 
 export default function GameScreen() {
   const [roundSettings, setRoundSettings] = useState<GameSettings | null>(null);
@@ -174,11 +222,11 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
         : activePlayers.length === 1
           ? createWinnerGeometry(baseRadius, width / 2, height / 2)
           : createPolygonGeometry(
-              activePlayers.length,
-              baseRadius,
-              width / 2,
-              height / 2,
-            ),
+            activePlayers.length,
+            baseRadius,
+            width / 2,
+            height / 2,
+          ),
     [activePlayers.length, baseRadius, width, height],
   );
 
@@ -196,7 +244,7 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
         paddleLength: 58,
         paddleThickness: 12,
 
-        initialBallSpeed: 280,
+        initialBallSpeed: 100,
         maxBallSpeed: MAX_BALL_SPEED,
 
         botMaxSpeed: botConfig.botMaxSpeed,
@@ -267,6 +315,10 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
     useGameStore.getState().addPoint(playerId);
   };
 
+  const paddleFlashWallSlot = useSharedValue(-1);
+  const paddleFlashProgress = useSharedValue(0);
+
+  const wallShatterProgress = useSharedValue(1);
   /**
    * =========================================================
    * PHASE 3b TRANSITION
@@ -519,6 +571,15 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
      */
     playWallShatterSfx();
 
+    cancelAnimation(wallShatterProgress);
+
+    wallShatterProgress.value = 0;
+
+    wallShatterProgress.value = withTiming(1, {
+      duration: 120,
+      easing: Easing.out(Easing.quad),
+    });
+
     const nextPlayers = activePlayers.filter(
       (id) => id !== playerId,
     );
@@ -574,22 +635,22 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
     const nextGeometry =
       nextPlayers.length === 2
         ? createTwoPlayerRectangleGeometry(
+          baseRadius,
+          width / 2,
+          height / 2,
+        )
+        : nextPlayers.length === 1
+          ? createWinnerGeometry(
             baseRadius,
             width / 2,
             height / 2,
           )
-        : nextPlayers.length === 1
-          ? createWinnerGeometry(
-              baseRadius,
-              width / 2,
-              height / 2,
-            )
           : createPolygonGeometry(
-              nextPlayers.length,
-              baseRadius,
-              width / 2,
-              height / 2,
-            );
+            nextPlayers.length,
+            baseRadius,
+            width / 2,
+            height / 2,
+          );
 
     startGeometryTransition(
       oldGeometry,
@@ -603,29 +664,29 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
     setActivePlayers(nextPlayers);
   };
 
-  const cycleLocalPlayer = () => {
-    if (activePlayers.length === 0) {
-      return;
-    }
+  // const cycleLocalPlayer = () => {
+  //   if (activePlayers.length === 0) {
+  //     return;
+  //   }
 
-    setLocalPlayerId((current) => {
-      const currentIndex = activePlayers.indexOf(current);
+  //   setLocalPlayerId((current) => {
+  //     const currentIndex = activePlayers.indexOf(current);
 
-      const next =
-        activePlayers[
-          (currentIndex + 1 + activePlayers.length) %
-            activePlayers.length
-        ];
+  //     const next =
+  //       activePlayers[
+  //       (currentIndex + 1 + activePlayers.length) %
+  //       activePlayers.length
+  //       ];
 
-      localPlayerIdShared.value = next;
+  //     localPlayerIdShared.value = next;
 
-      playerPaddleOffset.value = 0;
+  //     playerPaddleOffset.value = 0;
 
-      gestureStartOffset.value = 0;
+  //     gestureStartOffset.value = 0;
 
-      return next;
-    });
-  };
+  //     return next;
+  //   });
+  // };
 
   const gestureStartOffset = useSharedValue(0);
 
@@ -690,7 +751,7 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
       const maxOffset = Math.max(
         0,
         currentWallLength / 2 -
-          currentPaddleLength / 2,
+        currentPaddleLength / 2,
       );
 
       const nextOffset =
@@ -867,12 +928,22 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
      * That avoids calling runOnJS once per collision when
      * several balls hit paddles in the same frame.
      */
-   
+
     if (result.paddleHitCount > 0) {
-  runOnJS(playPaddleHitSfx)(
-    result.paddleHitCount,
-  );
-}
+      runOnJS(playPaddleHitSfx)(
+        result.paddleHitCount,
+      );
+    }
+    if (result.paddleHitWallSlots.length > 0) {
+      const wallSlot = result.paddleHitWallSlots[0];
+
+      paddleFlashWallSlot.value = wallSlot;
+      paddleFlashProgress.value = 1;
+
+      paddleFlashProgress.value = withTiming(0, {
+        duration: 100,
+      });
+    }
     /**
      * =====================================================
      * MISS
@@ -929,29 +1000,53 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
     gameState.value = result.state;
   });
 
-  const scores = useGameStore(
-    (state) => state.scores,
+  // const scores = useGameStore(
+  //   (state) => state.scores,
+  // );
+
+  const [roundElapsedMs, setRoundElapsedMs] = useState(0);
+  useEffect(() => {
+    const startedAt = Date.now();
+
+    const interval = setInterval(() => {
+      setRoundElapsedMs(Date.now() - startedAt);
+    }, 1000);
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, []);
+
+  const botPlayers = activePlayers.filter(
+    (playerId) => playerId !== localPlayerId,
   );
 
   return (
     <GestureHandlerRootView style={styles.root}>
       <View style={styles.container}>
-        <Pressable
-          style={styles.debugButton}
-          onPress={cycleLocalPlayer}
-        >
-          <Text style={styles.debugButtonText}>
-            LOCAL: P{localPlayerId} · ROTATE
-          </Text>
-        </Pressable>
+        <View pointerEvents="box-none" style={styles.hud}>
+          <Pressable
+            style={styles.hudPause}
+            onPress={() => {
+              // Pause behavior will be added later.
+            }}
+            accessibilityRole="button"
+            accessibilityLabel="Pause game"
+          >
+            <Text style={styles.hudPauseIcon}>⏸️</Text>
+          </Pressable>
 
-        <Text style={styles.score}>
-          P{localPlayerId}:{" "}
-          {scores[localPlayerId] ?? 0}
-        </Text>
+          <Text style={styles.hudTimer}>
+            {formatRoundTime(roundElapsedMs)}
+          </Text>
+
+          <Text style={styles.hudWalls}>
+            WALLS {activePlayers.length}/8
+          </Text>
+        </View>
 
         <GestureDetector gesture={panGesture}>
-          <View style={{ height, width }}>
+          <View>
             <BackgroundGrid
               width={width}
               height={height}
@@ -974,9 +1069,31 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
               arenaScale={
                 arenaScaleShared
               }
+              paddleFlashWallSlot={paddleFlashWallSlot}
+              paddleFlashProgress={paddleFlashProgress}
+              wallShatterProgress={wallShatterProgress}
             />
           </View>
         </GestureDetector>
+
+        <View pointerEvents="none" style={styles.bottomLives}>
+          <LifeGroup
+            label="YOU"
+            lives={lives[localPlayerId] ?? 0}
+            color="#53F2FF"
+          />
+
+          <View style={styles.botLives}>
+            {botPlayers.map((playerId) => (
+              <LifeGroup
+                key={playerId}
+                label={`BOT ${playerId + 1}`}
+                lives={lives[playerId] ?? 0}
+                color="#FF4D9D"
+              />
+            ))}
+          </View>
+        </View>
       </View>
     </GestureHandlerRootView>
   );
@@ -1006,30 +1123,93 @@ const styles = StyleSheet.create({
     flex: 1,
   },
 
-  debugButton: {
+  hud: {
     position: "absolute",
-    top: 50,
-    right: 16,
-    zIndex: 100,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 8,
-    backgroundColor: "rgba(30,40,60,0.9)",
-  },
-
-  debugButtonText: {
-    color: "#8CC8FF",
-    fontSize: 11,
-    fontWeight: "700",
-  },
-
-  score: {
-    position: "absolute",
-    top: 52,
+    top: 48,
     left: 16,
+    right: 16,
+    height: 32,
     zIndex: 100,
-    color: "#63FF9A",
-    fontSize: 18,
-    fontWeight: "800",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
   },
-});
+
+  hudPause: {
+    position: "absolute",
+    left: 0,
+    width: 32,
+    height: 32,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  hudPauseIcon: {
+    fontSize: 25,
+    opacity: 0.8,
+  },
+
+  hudTimer: {
+    color: "#D7E9EE",
+    fontSize: 13,
+    fontWeight: "900",
+    letterSpacing: 1.2,
+  },
+
+  hudWalls: {
+    position: "absolute",
+    right: 0,
+    color: "#607985",
+    fontSize: 13,
+    fontWeight: "800",
+    letterSpacing: 1.4,
+  },
+  bottomLives: {
+    position: "absolute",
+    left: 16,
+    right: 16,
+    bottom: 24,
+    zIndex: 100,
+    flexDirection: "row",
+    alignItems: "flex-end",
+    justifyContent: "space-between",
+  },
+
+  botLives: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    justifyContent: "flex-end",
+    gap: 16,
+    flexWrap: "wrap",
+    maxWidth: "75%",
+  },
+
+  lifeGroup: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+
+  lifeLabel: {
+    fontSize: 8,
+    fontWeight: "900",
+    letterSpacing: 1.4,
+  },
+
+  lifePips: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+  },
+
+  lifePip: {
+    fontSize: 13,
+    fontWeight: "900",
+    textShadowColor: "rgba(255,255,255,0.35)",
+    textShadowOffset: {
+      width: 0,
+      height: 0,
+    },
+    textShadowRadius: 5,
+  },
+}); 

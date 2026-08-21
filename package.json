@@ -6,7 +6,7 @@
     "@expo/ui": "~57.0.11",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@shopify/react-native-skia": "^2.11.0",
-    "expo": "~57.0.13",
+    "expo": "~57.0.15",
     "expo-audio": "~57.0.3",
     "expo-constants": "~57.0.11",
     "expo-device": "~57.0.1",
