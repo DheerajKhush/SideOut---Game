@@ -74,7 +74,7 @@ export function ArenaPreview({ size }: ArenaPreviewProps) {
       paddleLength: 58,
       paddleThickness: 12,
 
-      initialBallSpeed: 280,
+      initialBallSpeed: 150,
 
       maxBallSpeed: MAX_BALL_SPEED,
 

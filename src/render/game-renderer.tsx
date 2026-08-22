@@ -13,30 +13,11 @@ import {
   type PhysicsConfig,
 } from "@/game/engine/physics";
 
+import { NEUTRAL_TRAIL_COLOR, PLAYER_SLOT_COLORS } from "@/constants/game-colors";
 import type { PolygonGeometry, PolygonWall, Vec2 } from "@/game/engine/polygon";
 import { useMemo } from "react";
 
-/**
- * Single persistent player color system.
- *
- * Stable player id -> stable color.
- *
- * This is reused by:
- * - paddle/wall visuals
- * - ball trails
- */
-const PLAYER_SLOT_COLORS = [
-  "#67FFD1",
-  "#FF4D8D",
-  "#FFD166",
-  "#8B7CFF",
-  "#4DD9FF",
-  "#FF8A5B",
-  "#B8FF5A",
-  "#D98BFF",
-] as const;
 
-const NEUTRAL_TRAIL_COLOR = "#8BD8FF";
 
 const getPlayerSlotColor = (slot: number | null): string => {
   "worklet";

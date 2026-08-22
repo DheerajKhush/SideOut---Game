@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   Pressable,
@@ -62,6 +62,8 @@ import {
 import { BACKGROUND_OUTER } from "@/constants/game-colors";
 import BackgroundGrid from "@/render/backgroundGrid";
 import { GameRenderer } from "@/render/game-renderer";
+import { RoundResults } from "@/render/round-results";
+import { useRouter } from "expo-router";
 
 const PLAYER_COUNT = 8;
 const SHATTER_TRANSITION_MS = 500;
@@ -198,6 +200,8 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
     createPlayerIds,
   );
 
+  const [eliminationOrder, setEliminationOrder] = useState<number[]>([]);
+
   const [localPlayerId, setLocalPlayerId] = useState(0);
 
   const [lives, setLives] = useState<number[]>(() =>
@@ -319,6 +323,8 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
   const paddleFlashProgress = useSharedValue(0);
 
   const wallShatterProgress = useSharedValue(1);
+  const [finalStandings, setFinalStandings] = useState<number[]>([]);
+  const router = useRouter();
   /**
    * =========================================================
    * PHASE 3b TRANSITION
@@ -593,6 +599,19 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
         "[GAME STATE] 2 walls remain — entering playable rectangle phase.",
       );
     } else if (nextPlayers.length === 1) {
+      const winner = nextPlayers[0];
+      setEliminationOrder((current) => {
+        const nextOrder = current.includes(playerId)
+          ? current
+          : [...current, playerId];
+
+        setFinalStandings([
+          winner,
+          ...[...nextOrder].reverse(),
+        ]);
+
+        return nextOrder;
+      });
       console.log(
         `[GAME END] P${nextPlayers[0]} is the winner — 1 wall remains.`,
       );
@@ -1005,11 +1024,14 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
   // );
 
   const [roundElapsedMs, setRoundElapsedMs] = useState(0);
-  useEffect(() => {
-    const startedAt = Date.now();
 
+  const roundStartedAt = useRef(Date.now());
+
+  useEffect(() => {
     const interval = setInterval(() => {
-      setRoundElapsedMs(Date.now() - startedAt);
+      setRoundElapsedMs(
+        Date.now() - roundStartedAt.current,
+      );
     }, 1000);
 
     return () => {
@@ -1020,6 +1042,72 @@ function GameRound({ roundSettings }: { roundSettings: GameSettings }) {
   const botPlayers = activePlayers.filter(
     (playerId) => playerId !== localPlayerId,
   );
+  const restartRound = () => {
+    const initialPlayers = createPlayerIds();
+
+    setActivePlayers(initialPlayers);
+    setLocalPlayerId(0);
+    localPlayerIdShared.value = 0;
+
+    setLives(
+      new Array(PLAYER_COUNT).fill(
+        roundSettings.startingLives,
+      ),
+    );
+
+    setEliminationOrder([]);
+    setFinalStandings([]);
+
+    gameOverShared.value = false;
+    missPendingShared.value = false;
+
+    transitionActiveShared.value = false;
+    transitionProgress.value = 1;
+
+    transitionOldGeometryShared.value = null;
+    transitionOldActivePlayerIdsShared.value = [];
+    transitionNewGeometryShared.value = null;
+    transitionNewActivePlayerIdsShared.value = [];
+    transitionRemovedWallSlotShared.value = -1;
+
+    arenaRadiusShared.value = baseRadius;
+    arenaScaleShared.value = 1;
+
+    shrinkElapsedMs.value = 0;
+
+    spawnElapsedMs.value = 0;
+    nextSpawnAtMs.value = INITIAL_SPAWN_DELAY_MS;
+
+    playerPaddleOffset.value = 0;
+    gestureStartOffset.value = 0;
+
+    wallShatterProgress.value = 1;
+
+    paddleFlashWallSlot.value = -1;
+    paddleFlashProgress.value = 0;
+    roundStartedAt.current = Date.now();
+    setRoundElapsedMs(0);
+
+    gameState.value = createInitialState(
+      geometry,
+      CONFIG.initialBallSpeed,
+      randomLaunchAngle(),
+    );
+
+  };
+
+  if (finalStandings.length > 0) {
+    return (
+      <RoundResults
+        standings={finalStandings}
+        localPlayerId={localPlayerId}
+        onReplay={restartRound}
+        onHome={() => {
+          router.replace("/");
+        }}
+      />
+    );
+  }
 
   return (
     <GestureHandlerRootView style={styles.root}>
